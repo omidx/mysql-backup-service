@@ -1,59 +1,30 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# Directory paths for full and differential backups
-FULL_BACKUP_DIR="/path/to/full_backups"
-DIFF_BACKUP_DIR="/path/to/diff_backups"
+# Backward-compatible entrypoint. The v2 implementation lives in Python and
+# intentionally uses only the Python standard library.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${MYSQL_BACKUP_CONFIG:-/etc/mysql-backup-service/mysql-backup.conf}"
 
-# MySQL container name
-MYSQL_CONTAINER_NAME="mysql_container"
+if [[ -x "${SCRIPT_DIR}/mysql_backup_service.py" ]]; then
+  APP="${SCRIPT_DIR}/mysql_backup_service.py"
+elif [[ -x "/usr/local/lib/mysql-backup-service/mysql_backup_service.py" ]]; then
+  APP="/usr/local/lib/mysql-backup-service/mysql_backup_service.py"
+else
+  echo "mysql_backup_service.py not found" >&2
+  exit 1
+fi
 
-# MySQL database connection information
-MYSQL_USER="username"
-MYSQL_PASSWORD="password"
+if [[ $# -eq 0 ]]; then
+  exec python3 "$APP" --config "$CONFIG" run
+fi
 
-# Function to create a full backup
-create_full_backup() {
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    full_backup_file="$FULL_BACKUP_DIR/full_backup_$timestamp.sql.gz"
-    
-    docker exec $MYSQL_CONTAINER_NAME mysqldump -u $MYSQL_USER -p$MYSQL_PASSWORD --all-databases | gzip > $full_backup_file
+# Respect an explicit --config supplied by the caller; otherwise use the
+# service default (or MYSQL_BACKUP_CONFIG if set).
+for arg in "$@"; do
+  if [[ "$arg" == "--config" || "$arg" == --config=* ]]; then
+    exec python3 "$APP" "$@"
+  fi
+done
 
-    echo "Full backup created: $full_backup_file"
-}
-
-# Function to create a differential backup
-create_diff_backup() {
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    diff_backup_file="$DIFF_BACKUP_DIR/diff_backup_$timestamp.sql.gz"
-    
-    last_full_backup=$(ls -t $FULL_BACKUP_DIR/full_backup_* | head -n 1)
-
-    docker exec $MYSQL_CONTAINER_NAME mysqldump -u $MYSQL_USER -p$MYSQL_PASSWORD --all-databases --flush-logs --no-create-info --skip-triggers --skip-lock-tables --where="1 LIMIT 1000" | gzip > $diff_backup_file
-
-    echo "Diff backup created: $diff_backup_file"
-}
-
-# Function to delete old backups
-delete_old_backups() {
-    # Delete backups older than 7 days
-    find $FULL_BACKUP_DIR -type f -name "full_backup_*" -mtime +7 -exec rm {} \;
-    find $DIFF_BACKUP_DIR -type f -name "diff_backup_*" -mtime +7 -exec rm {} \;
-
-    echo "Old backups deleted"
-}
-
-# Run full backup every 12 hours
-while true; do
-    create_full_backup
-    delete_old_backups
-    sleep 43200 # 12 hours
-done &
-
-# Run differential backup every 1 hour
-while true; do
-    create_diff_backup
-    delete_old_backups
-    sleep 3600 # 1 hour
-done &
-
-wait # Wait for background jobs to finish
+exec python3 "$APP" --config "$CONFIG" "$@"
