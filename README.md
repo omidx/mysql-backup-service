@@ -1,135 +1,183 @@
 # MySQL Backup Service
 
-A production-oriented Linux backup service for MySQL that supports **per-database full backups**, **real differential backups based on MySQL binary logs**, flexible cron scheduling, automatic startup with `systemd`, retention, verification, checksums, restore assistance, Docker mode, and health checks.
+Production-oriented MySQL backup service for Linux with **Full + binary-log differential backups**, per-database schedules, encryption, off-host replication, point-in-time recovery, automated restore testing, GFS retention, throttling, and systemd startup.
 
-> Version 2 replaces the old pseudo-differential dump (`LIMIT 1000`) with a real recovery chain. A differential backup contains all binary-log changes from the latest full backup to the selected point in time.
+Current version: **2.1.0**
 
-## Features
+## What v2.1 adds
 
-- Full backup of every configured MySQL database using `mysqldump`
-- Differential backup using `mysqlbinlog`
-  - Base = latest full backup
-  - Restore chain = **one Full + one Diff**
-- Independent cron schedules for Full and Diff jobs
-- Automatic database discovery or explicit include/exclude lists
-- Native MySQL client mode or Docker-container mode
-- `systemd` service with automatic startup on boot
-- Configurable backup root directory
-- Per-database directory layout
-- Database name + backup type + date + time in every backup filename
-- Gzip compression with configurable level
-- SHA-256 checksum sidecar files
-- JSON manifest for every backup
-- Atomic `.partial` files to avoid treating interrupted backups as valid
-- Post-backup gzip verification
-- Pre-restore gzip, manifest, database, chain, and SHA-256 verification
-- Configurable free-space safety thresholds
-- Retention policy for Full and Diff backups
-- Protects Full backups still referenced by retained differential backups
-- Keeps a minimum number of Full backups even when age-based retention expires
-- Automatic fallback to a new Full backup when required binlogs have expired
-- Startup safety: automatically creates missing Full backups
-- Optional max-age safety net for missed schedules after downtime
-- Persistent state/status file
-- Rotating application log + journald output
-- Generic webhook notification support
-- Manual `check`, `backup`, `list`, `status`, `cleanup`, and `restore` commands
-- No third-party Python packages required
+- Remote/off-host backup through **rclone**
+  - AWS S3
+  - MinIO / any S3-compatible endpoint
+  - Backblaze B2 / B2 S3 API
+  - SFTP
+  - FTP
+  - any other rclone-supported backend
+- Atomic remote publication using a temporary `.partial.<id>` object and final `moveto`
+- Remote size verification before publish
+- Remote manifest is finalized last and acts as the completion marker
+- Optional S3-compatible **Object Lock** retention through AWS CLI
+- Encryption at rest before remote upload
+  - `age`
+  - GPG
+  - OpenSSL AES-256-CBC + PBKDF2
+- Exact point-in-time restore: `restore --to-time "YYYY-MM-DD HH:MM:SS"`
+- Scheduled disposable Docker restore tests
+- CPU/I/O/local-stream/remote-bandwidth throttling
+- Per-database schedules and retention policies
+- Excluded tables and schema-only tables for Full backups
+- GFS smart retention: daily / weekly / monthly restore points
+- Expanded CLI:
+  - `backup`
+  - `restore`
+  - `verify`
+  - `list`
+  - `status`
+  - `prune`
+  - `doctor`
+  - `config-test`
+  - `schedule`
+  - `restore-test`
+  - `version`
 
 ## Backup layout
 
-If:
+With:
 
 ```ini
+[general]
 backup_root = /backup
 backup_namespace = mysql_backup
 ```
 
-and the server contains databases `shop` and `reporting`, the service creates:
+the service creates one directory per database:
 
 ```text
-/backup/
-└── mysql_backup/
-    ├── shop/
-    │   ├── full/
-    │   │   ├── shop__full__2026-09-20_02-00-00.sql.gz
-    │   │   ├── shop__full__2026-09-20_02-00-00.sql.gz.json
-    │   │   └── shop__full__2026-09-20_02-00-00.sql.gz.sha256
-    │   └── diff/
-    │       ├── shop__diff__2026-09-20_03-00-00__base-shop__full__2026-09-20_02-00-00.sql.gz
-    │       ├── ...sql.gz.json
-    │       └── ...sql.gz.sha256
-    └── reporting/
-        ├── full/
-        └── diff/
+/backup/mysql_backup/
+├── appdb/
+│   ├── full/
+│   │   ├── appdb__full__2026-09-20_02-00-00.sql.gz.age
+│   │   ├── appdb__full__2026-09-20_02-00-00.sql.gz.age.json
+│   │   └── appdb__full__2026-09-20_02-00-00.sql.gz.age.sha256
+│   └── diff/
+│       ├── appdb__diff__2026-09-20_03-00-00__base-appdb__full__2026-09-20_02-00-00.sql.gz.age
+│       ├── ...json
+│       └── ...sha256
+└── reporting/
+    ├── full/
+    └── diff/
 ```
 
-## How differential backup works
+When encryption is disabled, the `.age`, `.gpg`, or `.enc` suffix is absent.
 
-A MySQL logical dump by itself does not provide a generic open-source "differential dump" mode. Version 2 therefore uses the MySQL binary log for differential recovery:
+## How Full and Diff work
 
-1. A Full backup is created with `mysqldump --single-transaction`.
-2. The exact binary-log file and position corresponding to that Full backup are embedded by `--source-data=2` (or `--master-data=2` on older clients).
-3. A Diff backup uses `mysqlbinlog` to collect changes from that Full-backup coordinate up to the current binary-log coordinate.
-4. Each database gets its own filtered differential stream.
-5. To restore, apply the Full backup and then one compatible Diff backup.
+A Full backup uses `mysqldump --single-transaction` and captures the exact binary-log coordinates using `--source-data=2` (or `--master-data=2` on older clients).
 
-For reliable per-database filtering, the default configuration requires:
-
-```ini
-binlog_format = ROW
-```
-
-The `check` command rejects Diff mode when binary logging is disabled or, by default, when the server is not using ROW format.
-
-## Requirements
-
-### Linux
-
-- Python 3.8+
-- `systemd`
-- `gzip` support through Python's standard library
-
-### Native mode
-
-Install MySQL client utilities containing:
+A Diff backup uses **one mysqlbinlog process across the complete binary-log range** from the selected Full coordinate to the current coordinate. This produces a simple restore chain:
 
 ```text
-mysql
-mysqldump
-mysqlbinlog
+FULL + one compatible DIFF
 ```
 
-### Docker mode
-
-- Docker installed on the host
-- `mysql`, `mysqldump`, and `mysqlbinlog` available inside the configured MySQL container
-
-## MySQL requirements
-
-Differential backups require MySQL binary logging.
-
-Check:
-
-```sql
-SHOW VARIABLES LIKE 'log_bin';
-SHOW VARIABLES LIKE 'binlog_format';
-```
-
-Recommended:
+For reliable database-level row-event filtering, Diff mode defaults to requiring:
 
 ```text
 log_bin = ON
 binlog_format = ROW
 ```
 
-MySQL 8.x normally uses ROW by default, but you should verify the actual server configuration.
+Run `mysql-backup-service doctor` to validate this.
 
-### Backup user
+## Exact Point-in-Time Recovery
 
-Use a dedicated account instead of `root`.
+Restore to an exact time:
 
-A typical MySQL 8.x starting point is:
+```bash
+sudo mysql-backup-service restore \
+  --database appdb \
+  --latest \
+  --to-time "2026-09-20 14:37:12" \
+  --yes
+```
+
+With `--latest`, the service selects the newest Full backup whose completion time is at or before the requested target. It then asks `mysqlbinlog` to replay a fixed snapshot of the source binary-log range from that Full coordinate up to the requested timestamp using `--stop-datetime`.
+
+### Important PITR requirement
+
+Exact PITR currently requires the original/source MySQL server's required binary logs to still be available. If the base binary log has expired, the command refuses to continue rather than silently producing an incomplete recovery.
+
+`mysqlbinlog --stop-datetime` interprets timestamps in the timezone of the machine where `mysqlbinlog` runs. The service detects the Docker container offset in Docker mode and converts the requested timestamp before invoking mysqlbinlog.
+
+## Requirements
+
+### Base requirements
+
+- Linux
+- Python 3.8+
+- systemd
+- MySQL client tools (`mysql`, `mysqldump`, `mysqlbinlog`) in native mode
+- or Docker in `mysql.mode=docker`
+
+### Optional feature dependencies
+
+| Feature | Tool |
+|---|---|
+| Remote storage | `rclone` |
+| age encryption | `age` |
+| GPG encryption | `gpg` |
+| OpenSSL encryption | `openssl` |
+| S3 Object Lock | AWS CLI v2 (`aws`) |
+| Automated restore test | Docker |
+| I/O priority | `ionice` |
+| CPU priority | `nice` |
+
+Optional tools are checked by `doctor`; the base service does not require third-party Python packages.
+
+## Installation
+
+```bash
+git clone https://github.com/omidx/mysql-backup-service.git
+cd mysql-backup-service
+sudo ./install.sh
+```
+
+Then edit:
+
+```bash
+sudo nano /etc/mysql-backup-service/mysql-backup.conf
+sudo nano /etc/mysql-backup-service/mysql-client.cnf
+sudo chmod 600 /etc/mysql-backup-service/mysql-client.cnf
+```
+
+Validate configuration only:
+
+```bash
+sudo mysql-backup-service config-test
+```
+
+Run runtime checks:
+
+```bash
+sudo mysql-backup-service doctor
+```
+
+Start the service:
+
+```bash
+sudo systemctl start mysql-backup-service
+sudo systemctl status mysql-backup-service
+```
+
+Logs:
+
+```bash
+sudo journalctl -u mysql-backup-service -f
+```
+
+## MySQL backup account
+
+Use a dedicated account instead of `root`. A typical MySQL 8.x starting point is:
 
 ```sql
 CREATE USER 'backup'@'127.0.0.1' IDENTIFIED BY 'CHANGE_ME';
@@ -140,471 +188,469 @@ GRANT SELECT, SHOW VIEW, TRIGGER, EVENT,
 ON *.* TO 'backup'@'127.0.0.1';
 ```
 
-Depending on your exact MySQL version, security policy, object definitions, GTID settings, and restore workflow, additional privileges can be required. The installer does **not** create or modify MySQL accounts automatically.
+Privileges vary by MySQL version and environment. Restore should use a separate controlled restore account. Row-based `mysqlbinlog` replay can require `BINLOG_ADMIN`, or `REPLICATION_APPLIER` plus the privileges required by the replayed events.
 
-For restore, use a separate privileged restore account. Replaying row-based `mysqlbinlog` output can require privileges such as `BINLOG_ADMIN`, or `REPLICATION_APPLIER` plus privileges required by the replayed operations.
+## Per-database policies
 
-## Installation
-
-Clone the repository:
-
-```bash
-git clone https://github.com/omidx/mysql-backup-service.git
-cd mysql-backup-service
-```
-
-Run the installer:
-
-```bash
-sudo ./install.sh
-```
-
-The installer:
-
-- installs the application under `/usr/local/lib/mysql-backup-service/`
-- installs `/usr/local/bin/mysql-backup-service`
-- creates `/etc/mysql-backup-service/mysql-backup.conf` if missing
-- creates `/etc/mysql-backup-service/mysql-client.cnf` if missing
-- installs the systemd unit
-- enables the service for automatic startup at boot
-- does **not** start the service until configuration is reviewed
-
-Edit the configuration:
-
-```bash
-sudo nano /etc/mysql-backup-service/mysql-backup.conf
-```
-
-Edit credentials:
-
-```bash
-sudo nano /etc/mysql-backup-service/mysql-client.cnf
-sudo chmod 600 /etc/mysql-backup-service/mysql-client.cnf
-```
-
-Validate everything before starting:
-
-```bash
-sudo mysql-backup-service check
-```
-
-Start the service:
-
-```bash
-sudo systemctl start mysql-backup-service
-```
-
-Check status:
-
-```bash
-sudo systemctl status mysql-backup-service
-```
-
-Follow logs:
-
-```bash
-sudo journalctl -u mysql-backup-service -f
-```
-
-The default rotating application log is also written to:
-
-```text
-/var/log/mysql-backup-service/backup.log
-```
-
-## Configuration
-
-The sample configuration is `mysql-backup.conf.example`.
-
-### Native MySQL
-
-```ini
-[mysql]
-mode = native
-host = 127.0.0.1
-port = 3306
-user = backup
-defaults_extra_file = /etc/mysql-backup-service/mysql-client.cnf
-password =
-```
-
-Recommended credential file:
-
-```ini
-[client]
-user=backup
-password=CHANGE_ME
-host=127.0.0.1
-port=3306
-```
-
-Keep it private:
-
-```bash
-sudo chmod 600 /etc/mysql-backup-service/mysql-client.cnf
-```
-
-### Docker MySQL
-
-Example:
-
-```ini
-[mysql]
-mode = docker
-container = mysql
-container_host = 127.0.0.1
-container_port = 3306
-user = backup
-password = CHANGE_ME
-# Or use a defaults file that exists INSIDE the container.
-defaults_extra_file =
-```
-
-The host account running the service must be able to execute `docker exec`.
-
-## Database selection
-
-Backup every non-excluded database:
-
-```ini
-include_databases = *
-exclude_databases = information_schema,performance_schema,sys
-```
-
-Backup only selected databases:
-
-```ini
-include_databases = appdb,reporting,mysql
-exclude_databases = information_schema,performance_schema,sys
-```
-
-`mysql` is intentionally not excluded by default. If you do not want MySQL system tables included, add it to `exclude_databases`.
-
-## Scheduling
-
-Schedules use standard **5-field cron** syntax:
-
-```text
-minute hour day-of-month month day-of-week
-```
-
-### Daily Full + hourly Diff
+Global defaults:
 
 ```ini
 [schedule]
 full = 0 2 * * *
 diff = 0 * * * *
+
+[retention]
+full_days = 30
+diff_days = 14
+minimum_full_backups = 2
+gfs_daily = 7
+gfs_weekly = 4
+gfs_monthly = 12
 ```
 
-Full: every day at 02:00  
-Diff: every hour at minute 00
-
-### Weekly Full + daily Diff
+Override any database:
 
 ```ini
-[schedule]
-full = 0 3 * * 0
-diff = 30 3 * * *
+[database:appdb]
+full_schedule = 0 2 * * *
+diff_schedule = 0 * * * *
+full_days = 30
+diff_days = 14
+gfs_daily = 7
+gfs_weekly = 4
+gfs_monthly = 12
+
+[database:reporting]
+full_schedule = 0 3 * * 0
+diff_schedule = 30 3 * * *
+full_days = 90
+diff_days = 30
+gfs_daily = 14
+gfs_weekly = 8
+gfs_monthly = 24
 ```
 
-Full: Sunday at 03:00  
-Diff: every day at 03:30
+Show effective schedules and the next three runs:
 
-### Full every 6 hours + Diff every 30 minutes
+```bash
+sudo mysql-backup-service schedule
+```
+
+## Excluding tables / schema-only tables
+
+Full-only example:
 
 ```ini
-[schedule]
-full = 0 */6 * * *
-diff = */30 * * * *
+[database:analytics]
+full_schedule = 0 4 * * *
+diff_schedule = off
+exclude_tables = audit_logs,cache_table
+schema_only_tables = giant_history
 ```
 
-### Disable one schedule
+Behavior:
+
+- `exclude_tables`: table structure and data are not included.
+- `schema_only_tables`: table definition/triggers are included, but table rows are not.
+
+### Safety restriction
+
+A database with table-level exclusions **must use `diff_schedule = off`**. `mysqlbinlog` database filtering can safely scope row-based replay to a database, but executable row-event replay does not provide a reliable general table-exclusion mechanism. Allowing a Full backup to omit a table and then replaying that table's row events could create a broken recovery chain, so `config-test` rejects that configuration.
+
+## Encryption at rest
+
+Encryption happens **after gzip compression and before remote upload**. SHA-256 is calculated over the final stored/encrypted artifact.
+
+### age
 
 ```ini
-[schedule]
-full = 0 2 * * *
-diff = off
+[encryption]
+enabled = true
+provider = age
+age_recipient = age1...
+age_identity_file = /etc/mysql-backup-service/age.key
 ```
 
-The service polls the schedule internally and records each executed minute, so one scheduled job is not repeated multiple times during the same minute.
+Keep the private identity file off the backup volume when possible and restrict permissions:
 
-### Missed-schedule safety
+```bash
+sudo chmod 600 /etc/mysql-backup-service/age.key
+```
 
-A server can be off during a scheduled time. Optional maximum-age checks can compensate:
+### GPG
 
 ```ini
-[schedule]
-full_max_age_hours = 36
-diff_max_age_minutes = 90
+[encryption]
+enabled = true
+provider = gpg
+gpg_recipient = backup@example.org
+gpg_homedir = /root/.gnupg
 ```
 
-Set either value to `0` to disable that safety net.
+### OpenSSL AES-256
 
-## Retention
+```ini
+[encryption]
+enabled = true
+provider = openssl
+openssl_passphrase_file = /etc/mysql-backup-service/backup.passphrase
+openssl_pbkdf2_iterations = 200000
+```
+
+```bash
+sudo chmod 600 /etc/mysql-backup-service/backup.passphrase
+```
+
+Older unencrypted v2.0 backup manifests remain readable even if encryption is later enabled; decryption behavior is selected from each backup manifest instead of assuming the current global setting.
+
+## Remote/Object Storage
+
+Remote replication uses `rclone`, so the service does not need cloud-provider SDKs or Python packages.
+
+Example destinations:
+
+```ini
+[remote]
+enabled = true
+backend = rclone
+rclone_config = /root/.config/rclone/rclone.conf
+retries = 3
+bwlimit = 50M
+
+# One of these, depending on the configured rclone remote:
+destination = minio:mysql-backups/server01
+# destination = aws:my-bucket/server01
+# destination = b2:my-bucket/server01
+# destination = sftp:/backups/server01
+# destination = ftp:/backups/server01
+```
+
+The rclone remote itself should be configured outside the Git repository:
+
+```bash
+rclone config
+```
+
+### Atomic remote publication
+
+For every backup bundle the service:
+
+1. uploads each local file as `<final>.partial.<random>`
+2. checks the remote object's size against the local file
+3. moves the temporary remote object to the final key
+4. applies Object Lock when configured
+5. publishes the JSON manifest **last**
+
+Consumers can therefore treat the final `.json` manifest as the completion marker.
+
+## S3 / MinIO Object Lock
+
+Object Lock is optional and only applies to S3-compatible destinations that support the API.
+
+```ini
+[object_lock]
+enabled = true
+bucket = mysql-backups
+prefix = server01
+mode = COMPLIANCE
+retention_days = 30
+endpoint_url = https://minio.example.org
+region = us-east-1
+aws_profile = backup
+```
+
+AWS S3 example can leave `endpoint_url` blank.
+
+Requirements:
+
+- bucket versioning/Object Lock enabled
+- AWS CLI configured for the same credentials/endpoint
+- permission equivalent to `s3:PutObjectRetention`
+
+Modes:
+
+- `GOVERNANCE`: privileged administrators can bypass retention if explicitly authorized.
+- `COMPLIANCE`: objects cannot be shortened/deleted before the retention date, including by root-level bucket administrators within the normal API model.
+
+Test immutability on a non-production bucket before enabling it. A wrong compliance retention period can intentionally make deletion impossible until expiry.
+
+## Remote retention behavior
+
+By default, local pruning does **not** delete remote data:
+
+```ini
+[remote]
+prune_with_local = false
+```
+
+To mirror local retention to remote storage:
+
+```ini
+prune_with_local = true
+```
+
+When Object Lock blocks a delete, local pruning continues and logs a warning for the remote object.
+
+## GFS smart retention
 
 Example:
 
 ```ini
 [retention]
-full_days = 30
-diff_days = 14
+gfs_daily = 7
+gfs_weekly = 4
+gfs_monthly = 12
 minimum_full_backups = 2
+diff_days = 14
 ```
 
-The cleanup logic:
+For Full backups, the service keeps the newest restore point in each selected calendar bucket:
 
-- removes expired Diff backups
-- removes expired Full backups
-- never removes a Full backup still referenced by a retained Diff
-- always preserves at least `minimum_full_backups`
-- removes abandoned `.partial` files older than one day
+- one daily Full for the last 7 days
+- one weekly Full for the last 4 weeks
+- one monthly Full for the last 12 months
+- at least `minimum_full_backups`
+- any Full still referenced by a retained Diff
 
-Set `full_days = 0` or `diff_days = 0` to disable age-based deletion for that backup type.
+This is **retention deduplication**, not block-level content deduplication.
 
-## Manual operations
+If all GFS values are `0`, traditional `full_days` age-based retention is used.
 
-### Check environment
+Preview deletion without changing anything:
 
 ```bash
-sudo mysql-backup-service check
+sudo mysql-backup-service prune --dry-run
 ```
 
-This validates:
+Run it:
 
-- configuration
-- required client utilities
-- MySQL connectivity
-- database discovery
-- `log_bin`
-- `binlog_format`
-- current binary-log coordinates
-- free disk space
+```bash
+sudo mysql-backup-service prune
+```
 
-### Run an immediate Full backup
+## Automated restore testing
 
-All configured databases:
+Enable a weekly disposable Docker restore test:
+
+```ini
+[restore_test]
+enabled = true
+schedule = 0 5 * * 0
+docker_image = mysql:8.4
+startup_timeout_seconds = 120
+databases = *
+validation_queries = SELECT 1
+```
+
+The service:
+
+1. creates an isolated disposable MySQL container with a random root password
+2. selects the latest Full and compatible Diff for each selected database
+3. verifies manifest, checksum, decryption, and gzip integrity
+4. restores the backup chain into the disposable container
+5. verifies the database is queryable
+6. runs optional validation queries
+7. records success/failure in service state
+8. destroys the container
+
+Run immediately:
+
+```bash
+sudo mysql-backup-service restore-test
+```
+
+Custom queries use `||` as the separator and support `{{database}}` substitution:
+
+```ini
+validation_queries = SELECT 1 || SELECT COUNT(*) FROM `{{database}}`.important_table
+```
+
+## Throttling
+
+```ini
+[throttle]
+nice = 10
+ionice_class = 2
+ionice_level = 7
+local_stream_mbps = 50
+
+[remote]
+bwlimit = 20M
+```
+
+- In native MySQL mode, `nice` lowers CPU scheduling priority of `mysqldump`/`mysqlbinlog` child processes.
+- In native MySQL mode, `ionice` lowers child-process I/O priority when available. In Docker source mode the host-side wrapper cannot directly change the container process scheduler priority.
+- `local_stream_mbps` works in both native and Docker source modes by throttling the dump/binlog byte stream before gzip writing and therefore back-pressuring the source process.
+- `remote.bwlimit` is passed to rclone and limits network transfer bandwidth.
+
+Set any throttle to `0`/blank to disable it.
+
+## CLI
+
+### Backup
 
 ```bash
 sudo mysql-backup-service backup --type full
-```
-
-One database:
-
-```bash
+sudo mysql-backup-service backup --type diff
 sudo mysql-backup-service backup --type full --database appdb
 ```
 
-Multiple selected databases:
+### Restore latest chain
 
 ```bash
-sudo mysql-backup-service backup --type full --database appdb --database reporting
+sudo mysql-backup-service restore --database appdb --latest --yes
 ```
 
-### Run an immediate Diff backup
+### Restore explicit chain
 
 ```bash
-sudo mysql-backup-service backup --type diff
+sudo mysql-backup-service restore \
+  --database appdb \
+  --full /backup/mysql_backup/appdb/full/<file> \
+  --diff /backup/mysql_backup/appdb/diff/<file> \
+  --yes
 ```
 
-### List backups
+### Exact PITR
+
+```bash
+sudo mysql-backup-service restore \
+  --database appdb \
+  --latest \
+  --to-time "2026-09-20 14:37:12" \
+  --yes
+```
+
+### Verify
+
+Deep verification (manifest + SHA-256 + decrypt + gzip scan):
+
+```bash
+sudo mysql-backup-service verify
+sudo mysql-backup-service verify --database appdb
+```
+
+Quick manifest/checksum verification:
+
+```bash
+sudo mysql-backup-service verify --quick
+```
+
+### List
 
 ```bash
 sudo mysql-backup-service list
 sudo mysql-backup-service list --database appdb
 ```
 
-### Service state
+### Status
 
 ```bash
 sudo mysql-backup-service status
+sudo mysql-backup-service status --json
 ```
 
-### Run retention now
+### Configuration / doctor
 
 ```bash
-sudo mysql-backup-service cleanup
+sudo mysql-backup-service config-test
+sudo mysql-backup-service doctor
 ```
 
-## Restore
+`check` remains as an alias for `doctor` for backward compatibility.
 
-> Test restores regularly. A backup is not proven until it has been restored successfully in a controlled environment.
-
-### Automatically select latest compatible chain
+### Schedule
 
 ```bash
-sudo mysql-backup-service restore \
-  --database appdb \
-  --latest \
-  --yes
+sudo mysql-backup-service schedule
 ```
 
-The restore command:
-
-1. selects the latest Full backup
-2. selects the newest Diff based on that exact Full, if one exists
-3. verifies gzip integrity
-4. validates backup type and database using the manifest
-5. validates the Full/Diff relationship
-6. verifies SHA-256 if configured
-7. restores the Full
-8. replays the Diff with `mysql --binary-mode`
-
-### Restore explicit files
+### Version
 
 ```bash
-sudo mysql-backup-service restore \
-  --database appdb \
-  --full /backup/mysql_backup/appdb/full/appdb__full__2026-09-20_02-00-00.sql.gz \
-  --diff /backup/mysql_backup/appdb/diff/appdb__diff__2026-09-20_08-00-00__base-appdb__full__2026-09-20_02-00-00.sql.gz \
-  --yes
+mysql-backup-service version
 ```
-
-Without `--yes`, restore refuses to execute.
 
 ## Backup metadata
 
-Every `.sql.gz` has a JSON manifest containing useful recovery metadata, including:
+Every backup has a JSON manifest containing data such as:
 
+- service version
 - backup type
 - database
-- start/end time
-- MySQL server version
-- file size
+- start/completion time
+- MySQL version
+- filename/size
 - SHA-256
-- Full backup binary-log starting coordinate
-- Diff base Full backup
-- Diff start/end binary-log coordinates
-- binary-log files used for the Diff
+- encryption provider
+- Full binary-log coordinate
+- Diff base Full filename
+- Diff start/end coordinates
+- binary-log files included
+- Full table exclusion/schema-only policy
 
-Example sidecars:
+The manifest is also the remote completion marker when remote replication is enabled.
 
-```text
-appdb__full__2026-09-20_02-00-00.sql.gz
-appdb__full__2026-09-20_02-00-00.sql.gz.json
-appdb__full__2026-09-20_02-00-00.sql.gz.sha256
-```
+## Failure safety
 
-## Free-space protection
+The service is intentionally fail-closed in recovery-critical situations:
 
-The service checks both absolute and percentage free space before backup:
+- local in-progress backups use `.partial`
+- remote uploads use random `.partial.<id>` keys
+- checksum/manifest creation happens after the data file is finalized
+- remote manifest is finalized last
+- failed command output never becomes a successful backup
+- Diff refuses to run if its base binlog is unavailable unless configured to create a fresh Full
+- table-filtered Full policies cannot be combined with Diff/PITR
+- exact PITR refuses to run if its source base binary log has expired
+- restore validates the selected Full/Diff relationship
+- one filesystem lock prevents overlapping backup/restore operations
 
-```ini
-[general]
-min_free_space_mb = 1024
-min_free_space_percent = 5
-```
+## Security recommendations
 
-A backup is rejected when either threshold is violated.
+- Do not commit database passwords, encryption keys, passphrases, rclone configs, or AWS credentials.
+- Keep credential/key files `0600`.
+- Prefer a dedicated least-privilege MySQL backup user.
+- Keep encryption private keys separate from the backup volume where possible.
+- Keep at least one backup copy off-host.
+- For ransomware-sensitive environments, use a tested immutable/Object-Locked destination.
+- Treat Docker socket access as privileged access.
+- Test restores regularly; automated restore testing complements, but does not replace, disaster-recovery exercises.
 
-## Notifications
-
-A generic HTTP JSON webhook can receive backup success/failure events:
-
-```ini
-[notifications]
-webhook_url = https://example.internal/hooks/mysql-backup
-on_success = false
-on_failure = true
-```
-
-The service sends JSON containing service name, version, timestamp, status, backup type, database, and detail.
-
-## Failure handling
-
-The service is designed to avoid silently producing unusable recovery chains:
-
-- command failures do not become successful backup files
-- in-progress files use a `.partial` suffix
-- Full backups fail if Diff is enabled but binary-log coordinates cannot be captured
-- Diff backups fail or automatically create a new Full when the base binlog has expired
-- gzip integrity can be checked after every backup
-- restore validates manifest/checksum/chain before applying data
-- a process lock prevents overlapping backup/restore operations
-- systemd restarts the daemon after unexpected process failure
-
-## Security notes
-
-- Do not place real passwords in the Git repository.
-- Prefer `defaults_extra_file` in native mode and keep it `0600`.
-- Use a dedicated least-privilege backup account.
-- Use a separate restore account with only the privileges needed for controlled recovery.
-- Protect the backup filesystem with restrictive Linux permissions.
-- Backups contain production data. Encrypt the filesystem, backup volume, or off-host destination where required.
-- Copy critical backups off-host. A local backup alone does not protect against host loss, ransomware, storage failure, or administrator error.
-- Restrict Docker socket access; membership in the Docker group is effectively highly privileged.
-- Test restore procedures on a non-production MySQL instance.
-
-## Binary-log retention planning
-
-A Diff needs every binary log from the base Full backup coordinate to the Diff endpoint.
-
-Therefore, MySQL binary-log retention must be **longer than the maximum intended Full-to-Diff interval plus operational margin**.
-
-For example, if Full backups are weekly, keeping only one day of binary logs is not sufficient. If the required base binlog has expired, the service's default behavior is to create a new Full backup instead of producing an unsafe Diff.
-
-## Large databases
-
-This project intentionally uses logical Full backups for portability and simple recovery.
-
-For very large databases where logical dump time or restore time is unacceptable, consider a physical hot-backup tool such as Percona XtraBackup. Physical incremental backups have different operational requirements and are outside this project's current scope.
-
-## systemd commands
+## systemd
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable mysql-backup-service
 sudo systemctl start mysql-backup-service
 sudo systemctl restart mysql-backup-service
-sudo systemctl stop mysql-backup-service
 sudo systemctl status mysql-backup-service
 sudo journalctl -u mysql-backup-service -f
 ```
 
-## Upgrade
-
-Pull the latest version and rerun the installer:
+## Upgrade from v2.0
 
 ```bash
 git pull
 sudo ./install.sh
 ```
 
-Existing configuration and credential files are preserved.
+The installer preserves existing configuration and credential files. Because v2.1 adds new config sections, compare your installed configuration with `mysql-backup.conf.example` and add the features you want.
+
+Existing v2.0 unencrypted backups remain restorable even after v2.1 encryption is enabled; encryption metadata is interpreted per backup.
 
 ## Development / CI
-
-Run local checks:
 
 ```bash
 python3 -m py_compile mysql_backup_service.py
 python3 -m unittest discover -s tests -v
 bash -n backup_script.sh
 bash -n install.sh
+python3 mysql_backup_service.py --config mysql-backup.conf.example config-test
+python3 mysql_backup_service.py version
 ```
 
-GitHub Actions runs the same syntax/unit checks on pushes and pull requests.
-
-## Migration from the old script
-
-The original version:
-
-- stored Full and Diff backups in two global directories
-- used fixed sleep loops
-- hard-coded 12-hour Full / 1-hour Diff timing
-- required Docker
-- dumped all databases into one file
-- used `--where="1 LIMIT 1000"` for a so-called differential backup
-
-That last behavior was **not a valid MySQL differential backup** and could not represent all changed rows.
-
-Version 2 replaces it with:
-
-- one directory per database
-- independent Full/Diff schedules
-- native or Docker operation
-- systemd startup
-- real binary-log-based differential recovery
-- checksums, manifests, validation, retention, health checks, and restore tooling
+GitHub Actions runs syntax, unit, configuration, and CLI smoke tests on pushes and pull requests.
 
 ## License
 
