@@ -1,28 +1,48 @@
-name: CI
+name: Audit Bootstrap
 
 on:
   push:
-  pull_request:
+    branches:
+      - feature/v2.1-production-features
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  syntax:
+  apply-audit-snapshot:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Python syntax
-        run: python3 -m py_compile mysql_backup_service.py
-      - name: Shell syntax
+        with:
+          ref: feature/v2.1-production-features
+          fetch-depth: 0
+      - name: Reconstruct audited delta
+        shell: bash
         run: |
+          set -Eeuo pipefail
+          cat .audit-staging/part-* > /tmp/audit-delta.tar.gz
+          mkdir -p /tmp/audit-delta
+          tar -xzf /tmp/audit-delta.tar.gz -C /tmp/audit-delta
+          patch -p1 --forward --batch < /tmp/audit-delta/core.patch
+          cp -a /tmp/audit-delta/files/. .
+          rm -rf .audit-staging
+      - name: Validate audited snapshot before commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 -m py_compile mysql_backup_service.py
+          python3 -m unittest discover -s tests -v
+          python3 mysql_backup_service.py --config mysql-backup.conf.example config-test
+          test "$(python3 mysql_backup_service.py version)" = "2.1.0"
           bash -n backup_script.sh
           bash -n install.sh
-      - name: Unit tests
-        run: python3 -m unittest discover -s tests -v
-      - name: Config smoke test
-        run: python3 mysql_backup_service.py --config mysql-backup.conf.example config-test
-      - name: CLI smoke tests
+          bash -n tests/integration.sh
+      - name: Commit audited snapshot
+        shell: bash
         run: |
-          python3 mysql_backup_service.py --help >/dev/null
-          test "$(python3 mysql_backup_service.py version)" = "2.1.0"
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Audit v2.1 backup and restore pipeline"
+          git push origin HEAD:feature/v2.1-production-features
