@@ -26,6 +26,7 @@ if [[ ! -f "$CONF_DIR/mysql-backup.conf" ]]; then
   echo "Created $CONF_DIR/mysql-backup.conf"
 else
   echo "Keeping existing $CONF_DIR/mysql-backup.conf"
+  echo "Compare it with mysql-backup.conf.example to enable new v2.1 features."
 fi
 
 if [[ ! -f "$CONF_DIR/mysql-client.cnf" ]]; then
@@ -40,14 +41,21 @@ systemctl enable mysql-backup-service.service
 
 cat <<EOF
 
-Installed MySQL Backup Service.
+Installed MySQL Backup Service v2.1.
 
 Next steps:
   1. Edit $CONF_DIR/mysql-backup.conf
   2. Edit $CONF_DIR/mysql-client.cnf and keep it chmod 600
-  3. Validate: $BIN_PATH --config $CONF_DIR/mysql-backup.conf check
-  4. Start:    systemctl start mysql-backup-service
-  5. Logs:     journalctl -u mysql-backup-service -f
+  3. Config:   $BIN_PATH --config $CONF_DIR/mysql-backup.conf config-test
+  4. Doctor:   $BIN_PATH --config $CONF_DIR/mysql-backup.conf doctor
+  5. Start:    systemctl start mysql-backup-service
+  6. Logs:     journalctl -u mysql-backup-service -f
+
+Optional v2.1 features use external tools:
+  rclone  -> remote S3/MinIO/B2/SFTP/FTP
+  age/gpg/openssl -> encryption
+  aws     -> S3-compatible Object Lock
+  docker  -> automated restore testing
 
 The installer enables the service at boot but does not start it until you have
 reviewed the configuration and credentials.
