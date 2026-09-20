@@ -507,4 +507,202 @@ COORD_PATTERNS = [
 
 def parse_dump_coordinates(path: Path) -> Optional[Tuple[str, int]]:
     try:
-        with gz
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 500:
+                    break
+                for pattern in COORD_PATTERNS:
+                    match = pattern.search(line)
+                    if match:
+                        return match.group(1), int(match.group(2))
+    except Exception as exc:
+        raise BackupError(f"could not inspect dump coordinates in {path}: {exc}") from exc
+    return None
+
+
+class BackupManager:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.mysql = MySQLClient(settings)
+        self.state = StateStore(settings)
+        self.root = settings.backup_root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.s.state_dir.mkdir(parents=True, exist_ok=True)
+
+    def db_paths(self, db: str) -> Tuple[Path, Path, Path]:
+        base = self.root / safe_db_dir(db)
+        return base, base / "full", base / "diff"
+
+    def check_free_space(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(self.root)
+        min_mb = self.s.getint("general", "min_free_space_mb", 1024)
+        min_pct = self.s.getfloat("general", "min_free_space_percent", 5.0)
+        free_pct = usage.free * 100.0 / usage.total if usage.total else 0
+        if usage.free < min_mb * 1024 * 1024:
+            raise BackupError(
+                f"insufficient free space: {human_bytes(usage.free)} available; minimum is {min_mb} MiB"
+            )
+        if free_pct < min_pct:
+            raise BackupError(
+                f"insufficient free space: {free_pct:.1f}% available; minimum is {min_pct:.1f}%"
+            )
+
+    def selected_databases(self, requested: Optional[List[str]] = None) -> List[str]:
+        available = self.mysql.databases()
+        if not requested or requested == ["all"]:
+            return available
+        missing = [db for db in requested if db not in available]
+        if missing:
+            raise BackupError(f"requested database(s) not found or excluded: {', '.join(missing)}")
+        return requested
+
+    def _stream_command_to_gzip(self, args: Sequence[str], env: dict, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        level = max(1, min(9, self.s.getint("general", "gzip_level", 6)))
+        partial = dest.with_name(dest.name + ".partial")
+        stderr_fd, stderr_name = tempfile.mkstemp(prefix="mysql-backup-stderr-", text=True)
+        os.close(stderr_fd)
+        try:
+            with open(stderr_name, "wb") as stderr_fh, gzip.open(partial, "wb", compresslevel=level) as out_fh:
+                proc = subprocess.Popen(
+                    list(args),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_fh,
+                )
+                assert proc.stdout is not None
+                try:
+                    shutil.copyfileobj(proc.stdout, out_fh, length=1024 * 1024)
+                finally:
+                    proc.stdout.close()
+                rc = proc.wait()
+            if rc != 0:
+                err = Path(stderr_name).read_text(encoding="utf-8", errors="replace").strip()
+                raise BackupError(f"backup command failed ({rc}): {err}")
+            if partial.stat().st_size == 0:
+                raise BackupError("backup command produced an empty file")
+            os.replace(partial, dest)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                partial.unlink()
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(stderr_name)
+
+    def _append_command_to_gzip(self, args: Sequence[str], env: dict, gz_fh) -> None:
+        stderr_fd, stderr_name = tempfile.mkstemp(prefix="mysql-binlog-stderr-", text=True)
+        os.close(stderr_fd)
+        try:
+            with open(stderr_name, "wb") as stderr_fh:
+                proc = subprocess.Popen(
+                    list(args),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_fh,
+                )
+                assert proc.stdout is not None
+                try:
+                    shutil.copyfileobj(proc.stdout, gz_fh, length=1024 * 1024)
+                finally:
+                    proc.stdout.close()
+                rc = proc.wait()
+            if rc != 0:
+                err = Path(stderr_name).read_text(encoding="utf-8", errors="replace").strip()
+                raise BackupError(f"mysqlbinlog failed ({rc}): {err}")
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(stderr_name)
+
+    def _write_manifest(self, backup_file: Path, manifest: dict) -> Path:
+        manifest_path = backup_file.with_suffix(backup_file.suffix + ".json")
+        manifest["file"] = backup_file.name
+        manifest["size_bytes"] = backup_file.stat().st_size
+        manifest["sha256"] = sha256_file(backup_file)
+        atomic_json_write(manifest_path, manifest)
+        if self.s.getbool("general", "write_sha256_file", True):
+            checksum_path = backup_file.with_suffix(backup_file.suffix + ".sha256")
+            checksum_path.write_text(f"{manifest['sha256']}  {backup_file.name}\n", encoding="utf-8")
+        return manifest_path
+
+    def _verify_if_enabled(self, backup_file: Path) -> None:
+        if self.s.getbool("general", "verify_after_backup", True):
+            verify_gzip(backup_file)
+
+    def full_backup_one(self, db: str) -> dict:
+        self.check_free_space()
+        _, full_dir, _ = self.db_paths(db)
+        full_dir.mkdir(parents=True, exist_ok=True)
+        started = now_local()
+        stamp = timestamp_for_file(started)
+        file_name = f"{safe_db_dir(db)}__full__{stamp}.sql.gz"
+        dest = full_dir / file_name
+        LOG.info("FULL start database=%s destination=%s", db, dest)
+
+        need_coords = self.s.getbool("diff", "enabled", True)
+        args, env = self.mysql.dump_command(db, need_coordinates=need_coords)
+        self._stream_command_to_gzip(args, env, dest)
+        self._verify_if_enabled(dest)
+
+        coords = parse_dump_coordinates(dest) if need_coords else None
+        if need_coords and not coords:
+            dest.unlink(missing_ok=True)
+            raise BackupError(
+                f"full backup for {db} completed but no binary-log coordinates were found; differential backup chain would be unsafe"
+            )
+
+        finished = now_local()
+        manifest = {
+            "schema": 1,
+            "type": "full",
+            "database": db,
+            "started_at": started.isoformat(timespec="seconds"),
+            "finished_at": finished.isoformat(timespec="seconds"),
+            "server_version": self.mysql.server_version(),
+            "binlog_start": ({"file": coords[0], "position": coords[1]} if coords else None),
+        }
+        manifest_path = self._write_manifest(dest, manifest)
+        db_state = self.state.db(db)
+        db_state["last_full"] = {
+            "time": finished.isoformat(timespec="seconds"),
+            "file": str(dest),
+            "manifest": str(manifest_path),
+            "binlog_file": coords[0] if coords else None,
+            "binlog_position": coords[1] if coords else None,
+        }
+        self.state.set_success()
+        LOG.info("FULL complete database=%s size=%s", db, human_bytes(dest.stat().st_size))
+        self.notify("success", "full", db, str(dest))
+        return manifest
+
+    def latest_full_manifest(self, db: str) -> Optional[Tuple[Path, dict]]:
+        _, full_dir, _ = self.db_paths(db)
+        if not full_dir.exists():
+            return None
+        candidates = sorted(full_dir.glob("*.sql.gz.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in candidates:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("type") == "full" and data.get("database") == db:
+                    data_file = full_dir / data.get("file", "")
+                    if data_file.exists():
+                        return path, data
+            except Exception:
+                continue
+        return None
+
+    def diff_backup_one(self, db: str) -> dict:
+        if not self.s.getbool("diff", "enabled", True):
+            raise BackupError("differential backups are disabled in config")
+        self.check_free_space()
+        latest = self.latest_full_manifest(db)
+        if not latest:
+            policy = self.s.get("diff", "missing_full_policy", "full").lower()
+            if policy == "full":
+                LOG.warning("No full backup exists for %s; creating one instead of differential", db)
+                return self.full_backup_one(db)
+            raise BackupError(f"cannot create differential backup for {db}: no full backup exists")
+
+        full_manifest_path, full_manifest = latest
+        start = full_manifest.get("binlog_start") or {}
+        start_file = start.get("file")
+        start_pos
