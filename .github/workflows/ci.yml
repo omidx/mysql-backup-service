@@ -20,5 +20,9 @@ jobs:
           bash -n install.sh
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
-      - name: CLI smoke test
-        run: python3 mysql_backup_service.py --help >/dev/null
+      - name: Config smoke test
+        run: python3 mysql_backup_service.py --config mysql-backup.conf.example config-test
+      - name: CLI smoke tests
+        run: |
+          python3 mysql_backup_service.py --help >/dev/null
+          test "$(python3 mysql_backup_service.py version)" = "2.1.0"
