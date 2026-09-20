@@ -1,4 +1,4 @@
-# MySQL Backup Service v2 configuration
+# MySQL Backup Service v2.1 configuration
 # Install as: /etc/mysql-backup-service/mysql-backup.conf
 
 [general]
@@ -21,7 +21,7 @@ min_free_space_percent = 5
 stop_on_database_error = false
 
 [mysql]
-# native = use mysql/mysqldump/mysqlbinlog installed on this Linux host
+# native = mysql/mysqldump/mysqlbinlog installed on this Linux host
 # docker = execute those utilities inside the configured MySQL container
 mode = native
 host = 127.0.0.1
@@ -30,22 +30,18 @@ socket =
 user = backup
 
 # Prefer defaults_extra_file over an inline password.
-# Native example: /etc/mysql-backup-service/mysql-client.cnf
-# Docker mode: this path must exist INSIDE the container.
 defaults_extra_file = /etc/mysql-backup-service/mysql-client.cnf
 password =
 
-# Docker-only settings
+# Docker-only source settings
 container = mysql
 container_host = 127.0.0.1
 container_port = 3306
 
-# * = auto-discover every non-excluded database.
-# Or use: appdb,reporting,mysql
+# * = discover every non-excluded database.
 include_databases = *
 exclude_databases = information_schema,performance_schema,sys
 
-# Safe mysqldump defaults. Custom flags are appended verbatim using shell-like parsing.
 set_gtid_purged_off = true
 no_tablespaces = true
 add_drop_database = false
@@ -54,44 +50,150 @@ mysql_extra_args =
 mysqlbinlog_extra_args =
 
 [schedule]
-# Standard 5-field cron: minute hour day-of-month month day-of-week
-# Examples:
-#   Daily full 02:00 + hourly diff:
+# Global defaults. Per-database sections can override them.
 full = 0 2 * * *
 diff = 0 * * * *
-#   Weekly Sunday 03:00 full + daily 03:30 diff:
-# full = 0 3 * * 0
-# diff = 30 3 * * *
-#   Disable one schedule with: off
-
 poll_seconds = 20
 full_on_start_if_missing = true
-
-# Optional safety net for missed schedules after downtime. 0 disables.
-# Example: force a full if the oldest DB full is > 36 hours old.
 full_max_age_hours = 0
-# Example: force a diff if the oldest DB diff is > 90 minutes old.
 diff_max_age_minutes = 0
 
 [diff]
 enabled = true
-# Differential = all binary-log changes from the latest full backup up to now.
-# This gives a simple restore chain: FULL + one DIFF.
 filter_by_database = true
 require_row_binlog = true
-
-# If the base binary log expired or no full exists, automatically create a new full.
 gap_policy = full
 missing_full_policy = full
 
+[tables]
+# Global table policy. Values are unqualified table names.
+# IMPORTANT: executable mysqlbinlog replay cannot safely filter individual
+# tables. A database using exclude_tables/schema_only_tables must set its
+# diff_schedule = off.
+exclude_tables =
+schema_only_tables =
+
 [retention]
-# 0 = never delete by age.
+# Used when GFS is disabled for a database.
 full_days = 30
 diff_days = 14
 minimum_full_backups = 2
 
+# GFS smart retention. >0 enables GFS selection for Full backups.
+# Keeps newest Full per day/week/month bucket.
+gfs_daily = 7
+gfs_weekly = 4
+gfs_monthly = 12
+
+[encryption]
+# none/age/gpg/openssl. Encryption is applied after compression and before
+# remote upload. Keys/passphrases must never live in this Git repository.
+enabled = false
+provider = age
+
+# age (recommended for simple file encryption)
+age_recipient =
+age_identity_file = /etc/mysql-backup-service/age.key
+
+# GPG
+gpg_recipient =
+gpg_homedir =
+
+# OpenSSL AES-256-CBC + PBKDF2
+openssl_passphrase_file = /etc/mysql-backup-service/backup.passphrase
+openssl_pbkdf2_iterations = 200000
+
+[remote]
+# rclone supports S3-compatible storage (AWS S3, MinIO, Backblaze B2 S3),
+# native B2, SFTP, FTP, and many other backends.
+enabled = false
+backend = rclone
+# Examples:
+# destination = minio:mysql-backups/server01
+# destination = aws:my-bucket/server01
+# destination = b2:my-bucket/server01
+# destination = sftp:/backups/server01
+# destination = ftp:/backups/server01
+destination =
+rclone_config = /root/.config/rclone/rclone.conf
+retries = 3
+# rclone syntax, e.g. 20M, 100M, 1G. Blank = unlimited.
+bwlimit =
+# If true, local retention also attempts deletion of corresponding remote files.
+# Object-locked files can legitimately refuse deletion until retention expires.
+prune_with_local = false
+
+[object_lock]
+# Optional S3-compatible immutability. Requires:
+# - S3 bucket with Object Lock/versioning enabled
+# - aws CLI configured for the same S3-compatible endpoint
+# - s3:PutObjectRetention equivalent permission
+enabled = false
+bucket =
+prefix = server01
+mode = GOVERNANCE
+retention_days = 30
+endpoint_url =
+region =
+aws_profile =
+
+[throttle]
+# Lower priority for mysqldump/mysqlbinlog child processes.
+# nice: 0 disables wrapper; common production value: 10
+nice = 10
+# ionice_class: 0 disables; 2 = best-effort, 3 = idle
+ionice_class = 2
+ionice_level = 7
+# Approximate uncompressed stream throttle for dump/binlog generation.
+# 0 = unlimited. Example: 50 means ~50 MiB/s.
+local_stream_mbps = 0
+
+[restore_test]
+# Automated disposable Docker restore verification.
+enabled = false
+schedule = 0 5 * * 0
+docker_image = mysql:8.4
+startup_timeout_seconds = 120
+databases = *
+# Optional queries separated by ||. {{database}} is replaced at runtime.
+# Example:
+# validation_queries = SELECT 1 || SELECT COUNT(*) FROM `{{database}}`.important_table
+validation_queries = SELECT 1
+
 [notifications]
-# Optional generic HTTP JSON webhook. Leave blank to disable.
 webhook_url =
 on_success = false
 on_failure = true
+
+# ---------------------------------------------------------------------------
+# Per-database policy example
+# ---------------------------------------------------------------------------
+# [database:appdb]
+# enabled = true
+# full_schedule = 0 2 * * *
+# diff_schedule = 0 * * * *
+# full_days = 30
+# diff_days = 14
+# minimum_full_backups = 2
+# gfs_daily = 7
+# gfs_weekly = 4
+# gfs_monthly = 12
+# exclude_tables =
+# schema_only_tables =
+#
+# [database:reporting]
+# enabled = true
+# full_schedule = 0 3 * * 0
+# diff_schedule = 30 3 * * *
+# full_days = 90
+# diff_days = 30
+# gfs_daily = 14
+# gfs_weekly = 8
+# gfs_monthly = 24
+#
+# Table-filtered database example (Full only):
+# [database:analytics]
+# full_schedule = 0 4 * * *
+# diff_schedule = off
+# exclude_tables = audit_logs,cache_table
+# schema_only_tables = giant_history
