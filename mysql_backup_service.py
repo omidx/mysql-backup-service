@@ -288,4 +288,223 @@ class CronSchedule:
         parts = expr.split()
         if len(parts) != 5:
             raise BackupError(
-     
+                f"cron expression must have 5 fields (minute hour day month weekday): {expr!r}"
+            )
+        self.expr = expr
+        self.minute = CronField(parts[0], 0, 59)
+        self.hour = CronField(parts[1], 0, 23)
+        self.dom = CronField(parts[2], 1, 31)
+        self.month = CronField(parts[3], 1, 12)
+        self.dow = CronField(parts[4], 0, 6, dow=True)
+
+    def matches(self, when: dt.datetime) -> bool:
+        cron_dow = (when.weekday() + 1) % 7  # Python Mon=0; cron Sun=0.
+        if not self.minute.matches(when.minute):
+            return False
+        if not self.hour.matches(when.hour):
+            return False
+        if not self.month.matches(when.month):
+            return False
+
+        dom_match = self.dom.matches(when.day)
+        dow_match = self.dow.matches(cron_dow)
+        if self.dom.is_wildcard and self.dow.is_wildcard:
+            day_match = True
+        elif self.dom.is_wildcard:
+            day_match = dow_match
+        elif self.dow.is_wildcard:
+            day_match = dom_match
+        else:
+            # Vixie cron semantics: when both are restricted, either may match.
+            day_match = dom_match or dow_match
+        return day_match
+
+
+class MySQLClient:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.mode = self.s.get("mysql", "mode", "native").lower()
+        if self.mode not in {"native", "docker"}:
+            raise BackupError("mysql.mode must be 'native' or 'docker'")
+        self.host = self.s.get("mysql", "host", "127.0.0.1")
+        self.port = self.s.getint("mysql", "port", 3306)
+        self.socket = self.s.get("mysql", "socket", "")
+        self.user = self.s.get("mysql", "user", "backup")
+        self.password = self.s.get("mysql", "password", "")
+        self.defaults_file = self.s.get("mysql", "defaults_extra_file", "")
+        self.container = self.s.get("mysql", "container", "mysql")
+        self.container_host = self.s.get("mysql", "container_host", "127.0.0.1")
+        self.container_port = self.s.getint("mysql", "container_port", 3306)
+        self._dump_help: Optional[str] = None
+
+    def _base_tool(self, tool: str, *, for_binlog: bool = False) -> Tuple[List[str], dict]:
+        env = os.environ.copy()
+        if self.password:
+            env["MYSQL_PWD"] = self.password
+
+        args: List[str] = []
+        if self.mode == "docker":
+            args = ["docker", "exec", "-i"]
+            if self.password:
+                args += ["-e", f"MYSQL_PWD={self.password}"]
+            args += [self.container, tool]
+            host = self.container_host
+            port = self.container_port
+        else:
+            args = [tool]
+            host = self.host
+            port = self.port
+
+        # mysql client options must follow the executable. --defaults-extra-file
+        # must appear before most other options for MySQL utilities.
+        if self.defaults_file:
+            args.append(f"--defaults-extra-file={self.defaults_file}")
+        args += [f"--user={self.user}"]
+        if self.socket and not for_binlog and self.mode == "native":
+            args += [f"--socket={self.socket}"]
+        else:
+            args += [f"--host={host}", f"--port={port}"]
+        return args, env
+
+    def _run(self, args: Sequence[str], env: dict, check: bool = True) -> subprocess.CompletedProcess:
+        proc = subprocess.run(
+            list(args),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if check and proc.returncode != 0:
+            stderr = proc.stderr.strip() or proc.stdout.strip()
+            raise BackupError(f"command failed ({proc.returncode}): {stderr}")
+        return proc
+
+    def query(self, sql: str, check: bool = True) -> List[List[str]]:
+        args, env = self._base_tool("mysql")
+        args += ["--batch", "--skip-column-names", "--raw", "--execute", sql]
+        proc = self._run(args, env, check=check)
+        if proc.returncode != 0:
+            return []
+        rows = []
+        for line in proc.stdout.splitlines():
+            rows.append(line.split("\t"))
+        return rows
+
+    def server_version(self) -> str:
+        rows = self.query("SELECT VERSION()")
+        return rows[0][0] if rows else "unknown"
+
+    def variable(self, name: str) -> str:
+        rows = self.query(f"SHOW VARIABLES LIKE '{name}'")
+        if rows and len(rows[0]) >= 2:
+            return rows[0][1]
+        return ""
+
+    def databases(self) -> List[str]:
+        rows = self.query("SHOW DATABASES")
+        include = csv_list(self.s.get("mysql", "include_databases", "*")) or ["*"]
+        exclude = set(csv_list(self.s.get("mysql", "exclude_databases", "information_schema,performance_schema,sys")))
+        found = [r[0] for r in rows if r and r[0] not in SYSTEM_DATABASES and r[0] not in exclude]
+        if include != ["*"]:
+            allowed = set(include)
+            found = [db for db in found if db in allowed]
+        return sorted(found)
+
+    def binary_log_status(self) -> Tuple[str, int]:
+        # New spelling first (MySQL 8.4+), then compatibility spelling.
+        rows = self.query("SHOW BINARY LOG STATUS", check=False)
+        if not rows:
+            rows = self.query("SHOW MASTER STATUS", check=False)
+        if not rows or len(rows[0]) < 2:
+            raise BackupError("binary logging is unavailable or backup user lacks permission to read binary log status")
+        return rows[0][0], int(rows[0][1])
+
+    def binary_logs(self) -> List[str]:
+        rows = self.query("SHOW BINARY LOGS")
+        return [r[0] for r in rows if r]
+
+    def dump_help(self) -> str:
+        if self._dump_help is None:
+            if self.mode == "docker":
+                args = ["docker", "exec", "-i", self.container, "mysqldump", "--help"]
+                env = os.environ.copy()
+            else:
+                args, env = ["mysqldump", "--help"], os.environ.copy()
+            proc = self._run(args, env, check=False)
+            self._dump_help = proc.stdout + proc.stderr
+        return self._dump_help
+
+    def source_data_option(self) -> str:
+        help_text = self.dump_help()
+        if "--source-data" in help_text:
+            return "--source-data=2"
+        if "--master-data" in help_text:
+            return "--master-data=2"
+        raise BackupError("mysqldump does not support --source-data/--master-data required for differential backups")
+
+    def dump_command(self, database: str, need_coordinates: bool) -> Tuple[List[str], dict]:
+        args, env = self._base_tool("mysqldump")
+        help_text = self.dump_help()
+        args += [
+            "--single-transaction",
+            "--quick",
+            "--routines",
+            "--events",
+            "--triggers",
+            "--hex-blob",
+            "--default-character-set=utf8mb4",
+        ]
+        if "--set-gtid-purged" in help_text and self.s.getbool("mysql", "set_gtid_purged_off", True):
+            args.append("--set-gtid-purged=OFF")
+        if "--no-tablespaces" in help_text and self.s.getbool("mysql", "no_tablespaces", True):
+            args.append("--no-tablespaces")
+        if need_coordinates:
+            args.append(self.source_data_option())
+        if self.s.getbool("mysql", "add_drop_database", False):
+            args.append("--add-drop-database")
+        extra = self.s.get("mysql", "dump_extra_args", "")
+        if extra:
+            args += shlex.split(extra)
+        args += ["--databases", database]
+        return args, env
+
+    def mysqlbinlog_command(
+        self,
+        database: str,
+        log_name: str,
+        start_position: Optional[int] = None,
+        stop_position: Optional[int] = None,
+    ) -> Tuple[List[str], dict]:
+        args, env = self._base_tool("mysqlbinlog", for_binlog=True)
+        args += ["--read-from-remote-server", "--verify-binlog-checksum"]
+        if self.s.getbool("diff", "filter_by_database", True):
+            args.append(f"--database={database}")
+        if start_position is not None:
+            args.append(f"--start-position={start_position}")
+        if stop_position is not None:
+            args.append(f"--stop-position={stop_position}")
+        extra = self.s.get("mysql", "mysqlbinlog_extra_args", "")
+        if extra:
+            args += shlex.split(extra)
+        args.append(log_name)
+        return args, env
+
+    def mysql_restore_command(self) -> Tuple[List[str], dict]:
+        args, env = self._base_tool("mysql")
+        # Required when replaying mysqlbinlog output containing binary/BLOB data.
+        args.append("--binary-mode")
+        extra = self.s.get("mysql", "mysql_extra_args", "")
+        if extra:
+            args += shlex.split(extra)
+        return args, env
+
+
+COORD_PATTERNS = [
+    re.compile(r"SOURCE_LOG_FILE='([^']+)'.*SOURCE_LOG_POS=(\d+)", re.I),
+    re.compile(r"MASTER_LOG_FILE='([^']+)'.*MASTER_LOG_POS=(\d+)", re.I),
+]
+
+
+def parse_dump_coordinates(path: Path) -> Optional[Tuple[str, int]]:
+    try:
+        with gz
