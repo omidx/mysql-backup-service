@@ -997,7 +997,8 @@ class BackupManager:
 
     def _finalize_plain_backup(self, plain_gz: Path, final_base: Path, manifest: dict) -> Tuple[Path, Path, Optional[Path]]:
         final_path = Path(str(final_base) + self.encryption.extension)
-        final_partial = Path(str(final_path) + ".partial")        try:
+        final_partial = Path(str(final_path) + ".partial")
+        try:
             if self.encryption.enabled:
                 self.encryption.encrypt(plain_gz, final_partial)
                 os.replace(final_partial, final_path)
