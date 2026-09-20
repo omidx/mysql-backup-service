@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.partial
+.env
+mysql-backup.conf
+mysql-client.cnf

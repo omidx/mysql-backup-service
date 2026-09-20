@@ -1,0 +1,97 @@
+# MySQL Backup Service v2 configuration
+# Install as: /etc/mysql-backup-service/mysql-backup.conf
+
+[general]
+# Backups are stored below: <backup_root>/<backup_namespace>/<database>/{full,diff}
+backup_root = /backup
+backup_namespace = mysql_backup
+state_dir = /var/lib/mysql-backup-service
+lock_file = /run/mysql-backup-service.lock
+log_level = INFO
+log_file = /var/log/mysql-backup-service/backup.log
+log_max_mb = 20
+log_backups = 5
+
+gzip_level = 6
+verify_after_backup = true
+verify_before_restore = true
+write_sha256_file = true
+min_free_space_mb = 1024
+min_free_space_percent = 5
+stop_on_database_error = false
+
+[mysql]
+# native = use mysql/mysqldump/mysqlbinlog installed on this Linux host
+# docker = execute those utilities inside the configured MySQL container
+mode = native
+host = 127.0.0.1
+port = 3306
+socket =
+user = backup
+
+# Prefer defaults_extra_file over an inline password.
+# Native example: /etc/mysql-backup-service/mysql-client.cnf
+# Docker mode: this path must exist INSIDE the container.
+defaults_extra_file = /etc/mysql-backup-service/mysql-client.cnf
+password =
+
+# Docker-only settings
+container = mysql
+container_host = 127.0.0.1
+container_port = 3306
+
+# * = auto-discover every non-excluded database.
+# Or use: appdb,reporting,mysql
+include_databases = *
+exclude_databases = information_schema,performance_schema,sys
+
+# Safe mysqldump defaults. Custom flags are appended verbatim using shell-like parsing.
+set_gtid_purged_off = true
+no_tablespaces = true
+add_drop_database = false
+dump_extra_args =
+mysql_extra_args =
+mysqlbinlog_extra_args =
+
+[schedule]
+# Standard 5-field cron: minute hour day-of-month month day-of-week
+# Examples:
+#   Daily full 02:00 + hourly diff:
+full = 0 2 * * *
+diff = 0 * * * *
+#   Weekly Sunday 03:00 full + daily 03:30 diff:
+# full = 0 3 * * 0
+# diff = 30 3 * * *
+#   Disable one schedule with: off
+
+poll_seconds = 20
+full_on_start_if_missing = true
+
+# Optional safety net for missed schedules after downtime. 0 disables.
+# Example: force a full if the oldest DB full is > 36 hours old.
+full_max_age_hours = 0
+# Example: force a diff if the oldest DB diff is > 90 minutes old.
+diff_max_age_minutes = 0
+
+[diff]
+enabled = true
+# Differential = all binary-log changes from the latest full backup up to now.
+# This gives a simple restore chain: FULL + one DIFF.
+filter_by_database = true
+require_row_binlog = true
+
+# If the base binary log expired or no full exists, automatically create a new full.
+gap_policy = full
+missing_full_policy = full
+
+[retention]
+# 0 = never delete by age.
+full_days = 30
+diff_days = 14
+minimum_full_backups = 2
+
+[notifications]
+# Optional generic HTTP JSON webhook. Leave blank to disable.
+webhook_url =
+on_success = false
+on_failure = true
