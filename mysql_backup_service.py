@@ -909,4 +909,182 @@ class BackupManager:
         else:
             missing_tools = []
             for tool in ("mysql", "mysqldump", "mysqlbinlog"):
-                pres
+                present = bool(shutil.which(tool))
+                result["checks"][tool] = present
+                if not present:
+                    missing_tools.append(tool)
+            if missing_tools:
+                raise BackupError(f"required MySQL client utilities not found: {', '.join(missing_tools)}")
+        result["server_version"] = self.mysql.server_version()
+        result["log_bin"] = self.mysql.variable("log_bin")
+        result["binlog_format"] = self.mysql.variable("binlog_format")
+        result["databases"] = self.mysql.databases()
+        result["binary_log_status"] = None
+        if self.s.getbool("diff", "enabled", True):
+            if str(result["log_bin"]).upper() not in {"ON", "1"}:
+                raise BackupError("diff.enabled=true but MySQL binary logging (log_bin) is not enabled")
+            require_row = self.s.getbool("diff", "require_row_binlog", True)
+            if require_row and str(result["binlog_format"]).upper() != "ROW":
+                raise BackupError(
+                    f"diff.require_row_binlog=true but binlog_format={result['binlog_format']!r}; ROW is required for reliable per-database filtering"
+                )
+            f, p = self.mysql.binary_log_status()
+            result["binary_log_status"] = {"file": f, "position": p}
+            # Validate that mysqlbinlog executable exists inside docker as well.
+            if self.mysql.mode == "docker":
+                test = subprocess.run(
+                    ["docker", "exec", self.mysql.container, "sh", "-c", "command -v mysqlbinlog && command -v mysqldump && command -v mysql"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if test.returncode != 0:
+                    raise BackupError(
+                        "mysql/mysqlbinlog/mysqldump were not all found inside the configured Docker container"
+                    )
+        self.check_free_space()
+        return result
+
+    def list_backups(self, database: Optional[str] = None) -> List[dict]:
+        rows: List[dict] = []
+        db_dirs = []
+        if database:
+            db_dirs = [self.root / safe_db_dir(database)]
+        elif self.root.exists():
+            db_dirs = [p for p in self.root.iterdir() if p.is_dir()]
+        for db_dir in db_dirs:
+            for kind in ("full", "diff"):
+                directory = db_dir / kind
+                if not directory.exists():
+                    continue
+                for manifest_path in sorted(directory.glob("*.sql.gz.json"), reverse=True):
+                    try:
+                        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        data["path"] = str(directory / data.get("file", ""))
+                        rows.append(data)
+                    except Exception:
+                        continue
+        rows.sort(key=lambda x: x.get("finished_at", ""), reverse=True)
+        return rows
+
+    def restore(self, database: str, full: Optional[str], diff: Optional[str], latest: bool, assume_yes: bool) -> None:
+        _, full_dir, diff_dir = self.db_paths(database)
+        if latest:
+            full_candidates = sorted(full_dir.glob("*.sql.gz.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not full_candidates:
+                raise BackupError(f"no full backup found for {database}")
+            full_manifest = json.loads(full_candidates[0].read_text(encoding="utf-8"))
+            full_path = full_dir / full_manifest["file"]
+            diff_candidates = sorted(diff_dir.glob("*.sql.gz.json"), key=lambda p: p.stat().st_mtime, reverse=True) if diff_dir.exists() else []
+            diff_path = None
+            for candidate in diff_candidates:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                if data.get("base_full_file") == full_manifest.get("file"):
+                    diff_path = diff_dir / data["file"]
+                    break
+        else:
+            if not full:
+                raise BackupError("--full is required unless --latest is used")
+            full_path = Path(full)
+            diff_path = Path(diff) if diff else None
+
+        if not full_path.exists():
+            raise BackupError(f"full backup not found: {full_path}")
+        if diff_path and not diff_path.exists():
+            raise BackupError(f"differential backup not found: {diff_path}")
+
+        self._verify_restore_input(full_path, expected_type="full", expected_database=database)
+        if diff_path:
+            diff_manifest = self._verify_restore_input(diff_path, expected_type="diff", expected_database=database)
+            if diff_manifest and diff_manifest.get("base_full_file") and diff_manifest.get("base_full_file") != full_path.name:
+                raise BackupError(
+                    f"differential backup {diff_path.name} is based on {diff_manifest.get('base_full_file')}, not {full_path.name}"
+                )
+
+        if not assume_yes:
+            raise BackupError(
+                "restore can overwrite existing data; rerun with --yes after verifying the selected backup chain"
+            )
+
+        LOG.warning("RESTORE starting database=%s full=%s diff=%s", database, full_path, diff_path)
+        self._restore_gzip_sql(full_path)
+        if diff_path:
+            self._restore_gzip_sql(diff_path)
+        LOG.warning("RESTORE completed database=%s", database)
+
+    def _verify_restore_input(self, source: Path, expected_type: str, expected_database: str) -> Optional[dict]:
+        verify_gzip(source)
+        manifest_path = source.with_suffix(source.suffix + ".json")
+        if not manifest_path.exists():
+            LOG.warning("No JSON manifest found for restore input %s; chain metadata cannot be fully validated", source)
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise BackupError(f"invalid manifest {manifest_path}: {exc}") from exc
+        if manifest.get("type") != expected_type:
+            raise BackupError(f"restore input {source} is not a {expected_type} backup according to its manifest")
+        if manifest.get("database") != expected_database:
+            raise BackupError(
+                f"restore input {source} belongs to database {manifest.get('database')!r}, not {expected_database!r}"
+            )
+        expected_sha = manifest.get("sha256")
+        if expected_sha and self.s.getbool("general", "verify_before_restore", True):
+            actual_sha = sha256_file(source)
+            if actual_sha.lower() != str(expected_sha).lower():
+                raise BackupError(
+                    f"SHA-256 verification failed for {source}: expected {expected_sha}, got {actual_sha}"
+                )
+        return manifest
+
+    def _restore_gzip_sql(self, source: Path) -> None:
+        cmd, env = self.mysql.mysql_restore_command()
+        stderr_fd, stderr_name = tempfile.mkstemp(prefix="mysql-restore-stderr-", text=True)
+        os.close(stderr_fd)
+        try:
+            with gzip.open(source, "rb") as in_fh, open(stderr_name, "wb") as stderr_fh:
+                proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stderr=stderr_fh)
+                assert proc.stdin is not None
+                try:
+                    shutil.copyfileobj(in_fh, proc.stdin, length=1024 * 1024)
+                finally:
+                    proc.stdin.close()
+                rc = proc.wait()
+            if rc != 0:
+                err = Path(stderr_name).read_text(encoding="utf-8", errors="replace").strip()
+                raise BackupError(f"restore failed ({rc}): {err}")
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(stderr_name)
+
+    def notify(self, status: str, kind: str, db: str, detail: str) -> None:
+        url = self.s.get("notifications", "webhook_url", "")
+        if not url:
+            return
+        if status == "success" and not self.s.getbool("notifications", "on_success", False):
+            return
+        if status == "failure" and not self.s.getbool("notifications", "on_failure", True):
+            return
+        payload = json.dumps(
+            {
+                "service": "mysql-backup-service",
+                "version": VERSION,
+                "time": iso_now(),
+                "status": status,
+                "backup_type": kind,
+                "database": db,
+                "detail": detail,
+            }
+        ).encode("utf-8")
+        req = urllib_request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib_request.urlopen(req, timeout=10) as response:
+                response.read(1024)
+        except Exception as exc:
+            LOG.warning("Webhook notification failed: %s", exc)
+
+
+class Scheduler:
+    def __init__(self, manager: BackupManager):
+        self.m = manager
+        sel
