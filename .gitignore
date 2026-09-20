@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 *.partial
+*.partial.*
 .env
 mysql-backup.conf
 mysql-client.cnf
+*.key
+*.passphrase
+rclone.conf
+credentials
