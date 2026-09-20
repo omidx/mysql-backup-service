@@ -315,3 +315,297 @@ Diff: every day at 03:30
 ```ini
 [schedule]
 full = 0 */6 * * *
+diff = */30 * * * *
+```
+
+### Disable one schedule
+
+```ini
+[schedule]
+full = 0 2 * * *
+diff = off
+```
+
+The service polls the schedule internally and records each executed minute, so one scheduled job is not repeated multiple times during the same minute.
+
+### Missed-schedule safety
+
+A server can be off during a scheduled time. Optional maximum-age checks can compensate:
+
+```ini
+[schedule]
+full_max_age_hours = 36
+diff_max_age_minutes = 90
+```
+
+Set either value to `0` to disable that safety net.
+
+## Retention
+
+Example:
+
+```ini
+[retention]
+full_days = 30
+diff_days = 14
+minimum_full_backups = 2
+```
+
+The cleanup logic:
+
+- removes expired Diff backups
+- removes expired Full backups
+- never removes a Full backup still referenced by a retained Diff
+- always preserves at least `minimum_full_backups`
+- removes abandoned `.partial` files older than one day
+
+Set `full_days = 0` or `diff_days = 0` to disable age-based deletion for that backup type.
+
+## Manual operations
+
+### Check environment
+
+```bash
+sudo mysql-backup-service check
+```
+
+This validates:
+
+- configuration
+- required client utilities
+- MySQL connectivity
+- database discovery
+- `log_bin`
+- `binlog_format`
+- current binary-log coordinates
+- free disk space
+
+### Run an immediate Full backup
+
+All configured databases:
+
+```bash
+sudo mysql-backup-service backup --type full
+```
+
+One database:
+
+```bash
+sudo mysql-backup-service backup --type full --database appdb
+```
+
+Multiple selected databases:
+
+```bash
+sudo mysql-backup-service backup --type full --database appdb --database reporting
+```
+
+### Run an immediate Diff backup
+
+```bash
+sudo mysql-backup-service backup --type diff
+```
+
+### List backups
+
+```bash
+sudo mysql-backup-service list
+sudo mysql-backup-service list --database appdb
+```
+
+### Service state
+
+```bash
+sudo mysql-backup-service status
+```
+
+### Run retention now
+
+```bash
+sudo mysql-backup-service cleanup
+```
+
+## Restore
+
+> Test restores regularly. A backup is not proven until it has been restored successfully in a controlled environment.
+
+### Automatically select latest compatible chain
+
+```bash
+sudo mysql-backup-service restore \
+  --database appdb \
+  --latest \
+  --yes
+```
+
+The restore command:
+
+1. selects the latest Full backup
+2. selects the newest Diff based on that exact Full, if one exists
+3. verifies gzip integrity
+4. validates backup type and database using the manifest
+5. validates the Full/Diff relationship
+6. verifies SHA-256 if configured
+7. restores the Full
+8. replays the Diff with `mysql --binary-mode`
+
+### Restore explicit files
+
+```bash
+sudo mysql-backup-service restore \
+  --database appdb \
+  --full /backup/mysql_backup/appdb/full/appdb__full__2026-09-20_02-00-00.sql.gz \
+  --diff /backup/mysql_backup/appdb/diff/appdb__diff__2026-09-20_08-00-00__base-appdb__full__2026-09-20_02-00-00.sql.gz \
+  --yes
+```
+
+Without `--yes`, restore refuses to execute.
+
+## Backup metadata
+
+Every `.sql.gz` has a JSON manifest containing useful recovery metadata, including:
+
+- backup type
+- database
+- start/end time
+- MySQL server version
+- file size
+- SHA-256
+- Full backup binary-log starting coordinate
+- Diff base Full backup
+- Diff start/end binary-log coordinates
+- binary-log files used for the Diff
+
+Example sidecars:
+
+```text
+appdb__full__2026-09-20_02-00-00.sql.gz
+appdb__full__2026-09-20_02-00-00.sql.gz.json
+appdb__full__2026-09-20_02-00-00.sql.gz.sha256
+```
+
+## Free-space protection
+
+The service checks both absolute and percentage free space before backup:
+
+```ini
+[general]
+min_free_space_mb = 1024
+min_free_space_percent = 5
+```
+
+A backup is rejected when either threshold is violated.
+
+## Notifications
+
+A generic HTTP JSON webhook can receive backup success/failure events:
+
+```ini
+[notifications]
+webhook_url = https://example.internal/hooks/mysql-backup
+on_success = false
+on_failure = true
+```
+
+The service sends JSON containing service name, version, timestamp, status, backup type, database, and detail.
+
+## Failure handling
+
+The service is designed to avoid silently producing unusable recovery chains:
+
+- command failures do not become successful backup files
+- in-progress files use a `.partial` suffix
+- Full backups fail if Diff is enabled but binary-log coordinates cannot be captured
+- Diff backups fail or automatically create a new Full when the base binlog has expired
+- gzip integrity can be checked after every backup
+- restore validates manifest/checksum/chain before applying data
+- a process lock prevents overlapping backup/restore operations
+- systemd restarts the daemon after unexpected process failure
+
+## Security notes
+
+- Do not place real passwords in the Git repository.
+- Prefer `defaults_extra_file` in native mode and keep it `0600`.
+- Use a dedicated least-privilege backup account.
+- Use a separate restore account with only the privileges needed for controlled recovery.
+- Protect the backup filesystem with restrictive Linux permissions.
+- Backups contain production data. Encrypt the filesystem, backup volume, or off-host destination where required.
+- Copy critical backups off-host. A local backup alone does not protect against host loss, ransomware, storage failure, or administrator error.
+- Restrict Docker socket access; membership in the Docker group is effectively highly privileged.
+- Test restore procedures on a non-production MySQL instance.
+
+## Binary-log retention planning
+
+A Diff needs every binary log from the base Full backup coordinate to the Diff endpoint.
+
+Therefore, MySQL binary-log retention must be **longer than the maximum intended Full-to-Diff interval plus operational margin**.
+
+For example, if Full backups are weekly, keeping only one day of binary logs is not sufficient. If the required base binlog has expired, the service's default behavior is to create a new Full backup instead of producing an unsafe Diff.
+
+## Large databases
+
+This project intentionally uses logical Full backups for portability and simple recovery.
+
+For very large databases where logical dump time or restore time is unacceptable, consider a physical hot-backup tool such as Percona XtraBackup. Physical incremental backups have different operational requirements and are outside this project's current scope.
+
+## systemd commands
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable mysql-backup-service
+sudo systemctl start mysql-backup-service
+sudo systemctl restart mysql-backup-service
+sudo systemctl stop mysql-backup-service
+sudo systemctl status mysql-backup-service
+sudo journalctl -u mysql-backup-service -f
+```
+
+## Upgrade
+
+Pull the latest version and rerun the installer:
+
+```bash
+git pull
+sudo ./install.sh
+```
+
+Existing configuration and credential files are preserved.
+
+## Development / CI
+
+Run local checks:
+
+```bash
+python3 -m py_compile mysql_backup_service.py
+python3 -m unittest discover -s tests -v
+bash -n backup_script.sh
+bash -n install.sh
+```
+
+GitHub Actions runs the same syntax/unit checks on pushes and pull requests.
+
+## Migration from the old script
+
+The original version:
+
+- stored Full and Diff backups in two global directories
+- used fixed sleep loops
+- hard-coded 12-hour Full / 1-hour Diff timing
+- required Docker
+- dumped all databases into one file
+- used `--where="1 LIMIT 1000"` for a so-called differential backup
+
+That last behavior was **not a valid MySQL differential backup** and could not represent all changed rows.
+
+Version 2 replaces it with:
+
+- one directory per database
+- independent Full/Diff schedules
+- native or Docker operation
+- systemd startup
+- real binary-log-based differential recovery
+- checksums, manifests, validation, retention, health checks, and restore tooling
+
+## License
+
+See [LICENSE](LICENSE).
