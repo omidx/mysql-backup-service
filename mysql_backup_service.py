@@ -1087,4 +1087,218 @@ class BackupManager:
 class Scheduler:
     def __init__(self, manager: BackupManager):
         self.m = manager
-        sel
+        self.s = manager.s
+        self.full_expr = self.s.get("schedule", "full", "0 2 * * *")
+        self.diff_expr = self.s.get("schedule", "diff", "0 * * * *")
+        self.full_schedule = None if self.full_expr.lower() in {"off", "disabled", "none", "-"} else CronSchedule(self.full_expr)
+        self.diff_schedule = None if self.diff_expr.lower() in {"off", "disabled", "none", "-"} else CronSchedule(self.diff_expr)
+        self.poll = max(5, self.s.getint("schedule", "poll_seconds", 20))
+
+    def _minute_token(self, when: dt.datetime) -> str:
+        return when.strftime("%Y%m%d%H%M")
+
+    def _already_ran(self, job: str, when: dt.datetime) -> bool:
+        return self.m.state.data.setdefault("scheduler", {}).get(job) == self._minute_token(when)
+
+    def _mark_ran(self, job: str, when: dt.datetime) -> None:
+        self.m.state.data.setdefault("scheduler", {})[job] = self._minute_token(when)
+        self.m.state.save()
+
+    def _latest_backup_age_minutes(self, kind: str) -> Optional[float]:
+        times = []
+        for db_state in self.m.state.data.get("databases", {}).values():
+            item = db_state.get(f"last_{kind}")
+            if item and item.get("time"):
+                try:
+                    t = dt.datetime.fromisoformat(item["time"])
+                    times.append(t)
+                except Exception:
+                    pass
+        if not times:
+            return None
+        oldest = min(times)
+        current = now_local()
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=current.tzinfo)
+        return (current - oldest).total_seconds() / 60.0
+
+    def startup_safety(self) -> None:
+        if self.s.getbool("schedule", "full_on_start_if_missing", True):
+            missing = [db for db in self.m.selected_databases() if not self.m.latest_full_manifest(db)]
+            if missing:
+                LOG.info("Startup safety: databases without a full backup: %s", ", ".join(missing))
+                with BackupLock(self.s.lock_file):
+                    self.m.backup("full", missing)
+
+    def tick(self, when: dt.datetime) -> None:
+        full_due = bool(self.full_schedule and self.full_schedule.matches(when) and not self._already_ran("full", when))
+        diff_due = bool(self.diff_schedule and self.diff_schedule.matches(when) and not self._already_ran("diff", when))
+
+        max_full_hours = self.s.getfloat("schedule", "full_max_age_hours", 0)
+        if not full_due and max_full_hours > 0:
+            age = self._latest_backup_age_minutes("full")
+            if age is None or age > max_full_hours * 60:
+                full_due = True
+
+        max_diff_minutes = self.s.getfloat("schedule", "diff_max_age_minutes", 0)
+        if not diff_due and max_diff_minutes > 0 and self.s.getbool("diff", "enabled", True):
+            age = self._latest_backup_age_minutes("diff")
+            if age is None or age > max_diff_minutes:
+                diff_due = True
+
+        if full_due:
+            try:
+                with BackupLock(self.s.lock_file):
+                    self.m.backup("full")
+                self._mark_ran("full", when)
+                # A differential at the same minute would contain little/no data
+                # and adds no restore value.
+                if diff_due:
+                    self._mark_ran("diff", when)
+                return
+            except BackupError as exc:
+                if "already running" not in str(exc):
+                    raise
+                LOG.info("Backup lock busy; will retry on next scheduler tick")
+
+        if diff_due and self.s.getbool("diff", "enabled", True):
+            try:
+                with BackupLock(self.s.lock_file):
+                    self.m.backup("diff")
+                self._mark_ran("diff", when)
+            except BackupError as exc:
+                if "already running" not in str(exc):
+                    raise
+                LOG.info("Backup lock busy; will retry on next scheduler tick")
+
+    def run(self) -> None:
+        LOG.info(
+            "Service started version=%s full_schedule=%r diff_schedule=%r poll=%ss",
+            VERSION,
+            self.full_expr,
+            self.diff_expr,
+            self.poll,
+        )
+        self.startup_safety()
+        while not STOP_REQUESTED:
+            try:
+                self.tick(now_local())
+            except Exception as exc:
+                LOG.exception("Scheduler iteration failed")
+                self.m.state.set_error(str(exc))
+            for _ in range(self.poll):
+                if STOP_REQUESTED:
+                    break
+                time.sleep(1)
+        LOG.info("Service stopping")
+
+
+def configure_logging(settings: Settings, verbose: bool = False) -> None:
+    level_name = "DEBUG" if verbose else settings.get("general", "log_level", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    LOG.setLevel(level)
+    LOG.handlers.clear()
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    LOG.addHandler(stream)
+
+    log_file = settings.get("general", "log_file", "/var/log/mysql-backup-service/backup.log")
+    if log_file and log_file.lower() not in {"off", "none", "-"}:
+        try:
+            path = Path(log_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            max_bytes = settings.getint("general", "log_max_mb", 20) * 1024 * 1024
+            backups = settings.getint("general", "log_backups", 5)
+            handler = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backups)
+            handler.setFormatter(formatter)
+            LOG.addHandler(handler)
+        except PermissionError:
+            LOG.warning("Cannot write configured log file %s; continuing with stdout/journald only", log_file)
+
+
+def install_signal_handlers() -> None:
+    def handler(signum, frame):
+        global STOP_REQUESTED
+        STOP_REQUESTED = True
+        LOG.info("Received signal %s", signum)
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+
+
+def print_json(value) -> None:
+    print(json.dumps(value, indent=2, sort_keys=True, default=str))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="MySQL full + differential backup service")
+    p.add_argument("--config", default=os.environ.get("MYSQL_BACKUP_CONFIG", DEFAULT_CONFIG))
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("run", help="run scheduler daemon (used by systemd)")
+
+    backup = sub.add_parser("backup", help="run a backup immediately")
+    backup.add_argument("--type", choices=["full", "diff"], required=True)
+    backup.add_argument("--database", action="append", help="database to back up; repeatable; default=all configured databases")
+
+    sub.add_parser("cleanup", help="apply retention policy now")
+    sub.add_parser("check", help="validate config, MySQL connectivity, binlog settings and free space")
+    sub.add_parser("status", help="show persistent service state")
+
+    ls = sub.add_parser("list", help="list backup manifests")
+    ls.add_argument("--database")
+
+    restore = sub.add_parser("restore", help="restore a full backup and optional differential")
+    restore.add_argument("--database", required=True)
+    restore.add_argument("--full", help="path to full .sql.gz")
+    restore.add_argument("--diff", help="path to differential .sql.gz")
+    restore.add_argument("--latest", action="store_true", help="automatically select latest compatible full + diff")
+    restore.add_argument("--yes", action="store_true", help="confirm that restore may overwrite existing data")
+
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        settings = Settings(args.config)
+        configure_logging(settings, args.verbose)
+        manager = BackupManager(settings)
+
+        if args.command == "run":
+            install_signal_handlers()
+            Scheduler(manager).run()
+        elif args.command == "backup":
+            with BackupLock(settings.lock_file):
+                manager.backup(args.type, args.database)
+        elif args.command == "cleanup":
+            with BackupLock(settings.lock_file):
+                manager.cleanup()
+        elif args.command == "check":
+            print_json(manager.check_environment())
+        elif args.command == "status":
+            print_json(manager.state.data)
+        elif args.command == "list":
+            print_json(manager.list_backups(args.database))
+        elif args.command == "restore":
+            with BackupLock(settings.lock_file):
+                manager.restore(args.database, args.full, args.diff, args.latest, args.yes)
+        else:
+            raise BackupError(f"unknown command: {args.command}")
+        return 0
+    except BackupError as exc:
+        LOG.error("%s", exc)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        LOG.exception("Unhandled error")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
