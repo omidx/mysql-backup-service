@@ -705,4 +705,208 @@ class BackupManager:
         full_manifest_path, full_manifest = latest
         start = full_manifest.get("binlog_start") or {}
         start_file = start.get("file")
-        start_pos
+        start_pos = start.get("position")
+        if not start_file or start_pos is None:
+            raise BackupError(f"latest full backup for {db} has no binary-log coordinates")
+
+        end_file, end_pos = self.mysql.binary_log_status()
+        logs = self.mysql.binary_logs()
+        if start_file not in logs:
+            policy = self.s.get("diff", "gap_policy", "full").lower()
+            if policy == "full":
+                LOG.warning(
+                    "Binlog %s required by %s has expired; creating a new full backup",
+                    start_file,
+                    db,
+                )
+                return self.full_backup_one(db)
+            raise BackupError(
+                f"binlog gap for {db}: {start_file} is no longer available; a new full backup is required"
+            )
+        if end_file not in logs:
+            raise BackupError(f"current binary log {end_file} was not returned by SHOW BINARY LOGS")
+
+        start_index = logs.index(start_file)
+        end_index = logs.index(end_file)
+        if end_index < start_index:
+            raise BackupError("binary log ordering is inconsistent")
+        selected_logs = logs[start_index : end_index + 1]
+
+        _, _, diff_dir = self.db_paths(db)
+        diff_dir.mkdir(parents=True, exist_ok=True)
+        started = now_local()
+        stamp = timestamp_for_file(started)
+        base_stamp = Path(full_manifest.get("file", "full")).name.replace(".sql.gz", "")
+        file_name = f"{safe_db_dir(db)}__diff__{stamp}__base-{base_stamp}.sql.gz"
+        dest = diff_dir / file_name
+        partial = dest.with_name(dest.name + ".partial")
+        level = max(1, min(9, self.s.getint("general", "gzip_level", 6)))
+        LOG.info(
+            "DIFF start database=%s from=%s:%s to=%s:%s logs=%d",
+            db,
+            start_file,
+            start_pos,
+            end_file,
+            end_pos,
+            len(selected_logs),
+        )
+
+        try:
+            with gzip.open(partial, "wb", compresslevel=level) as out_fh:
+                header = (
+                    f"-- mysql-backup-service differential backup\n"
+                    f"-- database: {db}\n"
+                    f"-- base full: {full_manifest.get('file')}\n"
+                    f"-- range: {start_file}:{start_pos} -> {end_file}:{end_pos}\n"
+                ).encode("utf-8")
+                out_fh.write(header)
+                for idx, log_name in enumerate(selected_logs):
+                    first = idx == 0
+                    last = idx == len(selected_logs) - 1
+                    cmd, env = self.mysql.mysqlbinlog_command(
+                        db,
+                        log_name,
+                        start_position=int(start_pos) if first else None,
+                        stop_position=int(end_pos) if last else None,
+                    )
+                    self._append_command_to_gzip(cmd, env, out_fh)
+            os.replace(partial, dest)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                partial.unlink()
+
+        self._verify_if_enabled(dest)
+        finished = now_local()
+        manifest = {
+            "schema": 1,
+            "type": "diff",
+            "mode": "differential-from-latest-full",
+            "database": db,
+            "started_at": started.isoformat(timespec="seconds"),
+            "finished_at": finished.isoformat(timespec="seconds"),
+            "server_version": self.mysql.server_version(),
+            "base_full_file": full_manifest.get("file"),
+            "base_full_manifest": full_manifest_path.name,
+            "binlog_start": {"file": start_file, "position": int(start_pos)},
+            "binlog_end": {"file": end_file, "position": int(end_pos)},
+            "binlog_files": selected_logs,
+        }
+        manifest_path = self._write_manifest(dest, manifest)
+        db_state = self.state.db(db)
+        db_state["last_diff"] = {
+            "time": finished.isoformat(timespec="seconds"),
+            "file": str(dest),
+            "manifest": str(manifest_path),
+            "base_full_file": full_manifest.get("file"),
+            "binlog_end_file": end_file,
+            "binlog_end_position": end_pos,
+        }
+        self.state.set_success()
+        LOG.info("DIFF complete database=%s size=%s", db, human_bytes(dest.stat().st_size))
+        self.notify("success", "diff", db, str(dest))
+        return manifest
+
+    def backup(self, kind: str, databases: Optional[List[str]] = None) -> None:
+        dbs = self.selected_databases(databases)
+        if not dbs:
+            raise BackupError("no databases matched the current include/exclude configuration")
+        errors = []
+        for db in dbs:
+            try:
+                if kind == "full":
+                    self.full_backup_one(db)
+                elif kind == "diff":
+                    self.diff_backup_one(db)
+                else:
+                    raise BackupError(f"unknown backup type: {kind}")
+            except Exception as exc:
+                errors.append(f"{db}: {exc}")
+                LOG.exception("%s backup failed for database=%s", kind.upper(), db)
+                self.notify("failure", kind, db, str(exc))
+                if self.s.getbool("general", "stop_on_database_error", False):
+                    break
+        if errors:
+            message = "; ".join(errors)
+            self.state.set_error(message)
+            raise BackupError(message)
+        self.cleanup()
+
+    def _manifest_for_file(self, backup_file: Path) -> Optional[dict]:
+        m = backup_file.with_suffix(backup_file.suffix + ".json")
+        if not m.exists():
+            return None
+        try:
+            return json.loads(m.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def cleanup(self) -> None:
+        full_days = self.s.getint("retention", "full_days", 30)
+        diff_days = self.s.getint("retention", "diff_days", 14)
+        min_full = max(1, self.s.getint("retention", "minimum_full_backups", 2))
+        now = time.time()
+
+        for db_dir in [p for p in self.root.iterdir() if p.is_dir()] if self.root.exists() else []:
+            full_dir = db_dir / "full"
+            diff_dir = db_dir / "diff"
+            diffs = sorted(diff_dir.glob("*.sql.gz"), key=lambda p: p.stat().st_mtime, reverse=True) if diff_dir.exists() else []
+
+            # Determine full backups referenced by differential backups that will remain.
+            protected_fulls = set()
+            for diff_file in diffs:
+                age_days = (now - diff_file.stat().st_mtime) / 86400
+                if diff_days <= 0 or age_days <= diff_days:
+                    manifest = self._manifest_for_file(diff_file)
+                    if manifest and manifest.get("base_full_file"):
+                        protected_fulls.add(manifest["base_full_file"])
+
+            if full_dir.exists():
+                fulls = sorted(full_dir.glob("*.sql.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
+                keep_by_count = {p.name for p in fulls[:min_full]}
+                for file in fulls:
+                    age_days = (now - file.stat().st_mtime) / 86400
+                    if full_days > 0 and age_days > full_days and file.name not in keep_by_count and file.name not in protected_fulls:
+                        self._delete_backup_set(file)
+                        LOG.info("Retention deleted full backup %s", file)
+
+            if diff_dir.exists() and diff_days > 0:
+                for file in diffs:
+                    age_days = (now - file.stat().st_mtime) / 86400
+                    if age_days > diff_days:
+                        self._delete_backup_set(file)
+                        LOG.info("Retention deleted differential backup %s", file)
+
+        # Clean abandoned partial files older than one day.
+        cutoff = now - 86400
+        if self.root.exists():
+            for partial in self.root.rglob("*.partial"):
+                with contextlib.suppress(OSError):
+                    if partial.stat().st_mtime < cutoff:
+                        partial.unlink()
+
+    def _delete_backup_set(self, file: Path) -> None:
+        candidates = [
+            file,
+            file.with_suffix(file.suffix + ".json"),
+            file.with_suffix(file.suffix + ".sha256"),
+        ]
+        for path in candidates:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+    def check_environment(self) -> dict:
+        result = {
+            "version": VERSION,
+            "config": str(self.s.path),
+            "backup_root": str(self.root),
+            "mode": self.mysql.mode,
+            "checks": {},
+        }
+        if self.mysql.mode == "docker":
+            result["checks"]["docker"] = bool(shutil.which("docker"))
+            if not result["checks"]["docker"]:
+                raise BackupError("docker executable was not found")
+        else:
+            missing_tools = []
+            for tool in ("mysql", "mysqldump", "mysqlbinlog"):
+                pres
