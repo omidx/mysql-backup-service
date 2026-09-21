@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Backward-compatible entrypoint. The v2 implementation lives in Python and
-# intentionally uses only the Python standard library.
+# Backward-compatible entrypoint for MySQL Backup Service v2.1.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${MYSQL_BACKUP_CONFIG:-/etc/mysql-backup-service/mysql-backup.conf}"
 
@@ -19,8 +18,6 @@ if [[ $# -eq 0 ]]; then
   exec python3 "$APP" --config "$CONFIG" run
 fi
 
-# Respect an explicit --config supplied by the caller; otherwise use the
-# service default (or MYSQL_BACKUP_CONFIG if set).
 for arg in "$@"; do
   if [[ "$arg" == "--config" || "$arg" == --config=* ]]; then
     exec python3 "$APP" "$@"

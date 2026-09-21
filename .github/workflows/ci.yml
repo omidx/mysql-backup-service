@@ -8,17 +8,56 @@ permissions:
   contents: read
 
 jobs:
-  syntax:
+  unit:
+    name: Unit / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.8', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Python syntax
+        run: python -m py_compile mysql_backup_service.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Config smoke test
+        run: python mysql_backup_service.py --config mysql-backup.conf.example config-test
+      - name: CLI smoke tests
+        run: |
+          python mysql_backup_service.py --help >/dev/null
+          test "$(python mysql_backup_service.py version)" = "2.1.0"
+
+  shell:
+    name: Shell / systemd syntax
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Python syntax
-        run: python3 -m py_compile mysql_backup_service.py
-      - name: Shell syntax
+      - name: Bash syntax
         run: |
           bash -n backup_script.sh
           bash -n install.sh
-      - name: Unit tests
-        run: python3 -m unittest discover -s tests -v
-      - name: CLI smoke test
-        run: python3 mysql_backup_service.py --help >/dev/null
+          bash -n tests/integration.sh
+      - name: systemd unit syntax
+        run: |
+          sudo install -m 0755 backup_script.sh /usr/local/bin/mysql-backup-service
+          systemd-analyze verify backup_service.service
+
+  integration:
+    name: MySQL 8.4 end-to-end recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+      - name: Run Docker integration
+        run: tests/integration.sh

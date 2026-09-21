@@ -1,5 +1,5 @@
 [Unit]
-Description=MySQL Backup Service v2
+Description=MySQL Backup Service v2.1
 Documentation=https://github.com/omidx/mysql-backup-service
 After=network-online.target docker.service
 Wants=network-online.target
@@ -12,8 +12,9 @@ RestartSec=10
 TimeoutStopSec=30
 UMask=0077
 
-# Broadly compatible hardening. If you run native mode, consider changing
-# User=root to a dedicated account with only backup/read permissions.
+# Default is root for broad compatibility with Docker, rclone/AWS credential
+# locations, and arbitrary backup mount points. Native-only deployments can
+# switch to a dedicated account after granting only the required paths.
 User=root
 Group=root
 NoNewPrivileges=true
@@ -27,8 +28,6 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 
-# Logs are written both to journald/stdout and (by default) to the configured
-# rotating log file.
 StandardOutput=journal
 StandardError=journal
 
