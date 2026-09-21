@@ -18,7 +18,10 @@ trap cleanup EXIT
 wait_mysql() {
   local container="$1"
   for _ in $(seq 1 90); do
-    if docker exec -e MYSQL_PWD="$ROOT_PASSWORD" "$container" mysqladmin -uroot ping --silent >/dev/null 2>&1; then
+    # mysqladmin ping returns success even when authentication is denied, so
+    # use an authenticated SQL query to wait for initialization to finish.
+    if docker exec -e MYSQL_PWD="$ROOT_PASSWORD" "$container" \
+      mysql -uroot --batch --skip-column-names -e 'SELECT 1' >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
