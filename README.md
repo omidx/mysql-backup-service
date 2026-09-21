@@ -122,7 +122,33 @@ Exact PITR currently requires the original/source MySQL server's required binary
 - Python 3.8+
 - systemd
 - MySQL client tools (`mysql`, `mysqldump`, `mysqlbinlog`) in native mode
-- or Docker in `mysql.mode=docker`
+- or Docker in `mysql.mode=docker`; Diff/PITR additionally require `mysqlbinlog` in the source or configured companion tools container
+
+### Docker source mode and `mysqlbinlog`
+
+Docker Official `mysql:8.4` is built from the minimal MySQL server package. It provides the server/client pieces needed for normal connectivity and logical Full dumps, but does not include `mysqlbinlog`. Full backups therefore work with the stock image, while Diff and exact PITR need a container that has the MySQL client tools.
+
+The repository includes a companion image:
+
+```bash
+docker build -t mysql-backup-tools:8.4 -f docker/mysql-tools/Dockerfile .
+docker run -d --name mysql-backup-tools \
+  --network container:mysql \
+  mysql-backup-tools:8.4 sleep infinity
+```
+
+Then configure:
+
+```ini
+[mysql]
+mode = docker
+container = mysql
+binlog_container = mysql-backup-tools
+container_host = 127.0.0.1
+container_port = 3306
+```
+
+`--network container:mysql` makes the helper share the database container's network namespace, so `127.0.0.1:3306` still points to the source MySQL. If your custom database image already contains `mysqlbinlog`, leave `binlog_container` blank and the service uses the source container directly. `doctor` verifies the selected container before Diff/PITR is relied on.
 
 ### Optional feature dependencies
 
