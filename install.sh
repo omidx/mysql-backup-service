@@ -64,6 +64,7 @@ Optional v2.1 features use external tools:
   age/gpg/openssl -> encryption
   aws     -> S3-compatible Object Lock
   docker  -> Docker source/target mode and automated restore testing
+  docker/mysql-tools/Dockerfile -> companion mysqlbinlog image for minimal MySQL containers
 
 The installer enables the service at boot but does not start it until you have
 reviewed the configuration and credentials.
