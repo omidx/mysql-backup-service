@@ -1665,13 +1665,13 @@ class BackupManager:
                     seen_daily.add(key)
                     keep.add(path.name)
             iso = when.isocalendar()
-            now_iso = now.isocalendar()
             # Monday anchors make week distance robust across year boundaries.
             when_monday = when.date() - dt.timedelta(days=when.weekday())
             now_monday = now.date() - dt.timedelta(days=now.weekday())
             week_age = (now_monday - when_monday).days // 7
             if policy.gfs_weekly > 0 and 0 <= week_age < policy.gfs_weekly:
-                keyw = (iso.year, iso.week)
+                # Python 3.8 returns a tuple-like value without .year/.week attributes.
+                keyw = (iso[0], iso[1])
                 if keyw not in seen_weekly:
                     seen_weekly.add(keyw)
                     keep.add(path.name)
