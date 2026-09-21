@@ -13,7 +13,7 @@ Current version: **2.1.0**
   - SFTP
   - FTP
   - any other rclone-supported backend
-- Atomic remote publication using a temporary `.partial.<id>` object and final `moveto`
+- Staged remote publication using temporary `.partial.<id>` objects and a manifest-last completion marker
 - Remote size verification before publish
 - Remote manifest is finalized last and acts as the completion marker
 - Optional S3-compatible **Object Lock** retention through AWS CLI
@@ -22,6 +22,7 @@ Current version: **2.1.0**
   - GPG
   - OpenSSL AES-256-CBC + PBKDF2
 - Exact point-in-time restore: `restore --to-time "YYYY-MM-DD HH:MM:SS"`
+- Separate backup Source and Restore Target connections for DR/PITR to a replacement server
 - Scheduled disposable Docker restore tests
 - CPU/I/O/local-stream/remote-bandwidth throttling
 - Per-database schedules and retention policies
@@ -72,7 +73,9 @@ When encryption is disabled, the `.age`, `.gpg`, or `.enc` suffix is absent.
 
 ## How Full and Diff work
 
-A Full backup uses `mysqldump --single-transaction` and captures the exact binary-log coordinates using `--source-data=2` (or `--master-data=2` on older clients).
+A Full backup uses `mysqldump --single-transaction` and captures the exact binary-log coordinates using `--source-data=2` (or `--master-data=2` on older clients). New installations default to `add_drop_database = true` so a Full restore into a non-empty target replaces the database cleanly instead of leaving stale objects that no longer exist in the backup.
+
+`--single-transaction` provides the strongest consistency for transactional engines such as InnoDB. If a selected database contains non-transactional tables (for example MyISAM), plan a maintenance/locking strategy or migrate those tables; a lock-free logical snapshot cannot guarantee the same cross-table consistency for non-transactional engines.
 
 A Diff backup uses **one mysqlbinlog process across the complete binary-log range** from the selected Full coordinate to the current coordinate. This produces a simple restore chain:
 
@@ -89,6 +92,8 @@ binlog_format = ROW
 
 Run `mysql-backup-service doctor` to validate this.
 
+By default, auto-discovery excludes `information_schema`, `performance_schema`, `sys`, and the MySQL system schema `mysql`. You can explicitly include `mysql` if you have a tested reason to back up grant/system tables, but MySQL 8.x does not permit `DROP DATABASE mysql`; the service therefore never emits `--add-drop-database` for that schema and `doctor` warns when it is selected.
+
 ## Exact Point-in-Time Recovery
 
 Restore to an exact time:
@@ -101,13 +106,13 @@ sudo mysql-backup-service restore \
   --yes
 ```
 
-With `--latest`, the service selects the newest Full backup whose completion time is at or before the requested target. It then asks `mysqlbinlog` to replay a fixed snapshot of the source binary-log range from that Full coordinate up to the requested timestamp using `--stop-datetime`.
+With `--latest`, the service selects the newest Full backup whose completion time is at or before the requested target. It reads a fixed binary-log snapshot from the Source configured in `[mysql]`, while SQL is applied to the optional independent `[restore_target]`. This allows DR/PITR into a replacement MySQL server without writing back into the production Source.
 
 ### Important PITR requirement
 
 Exact PITR currently requires the original/source MySQL server's required binary logs to still be available. If the base binary log has expired, the command refuses to continue rather than silently producing an incomplete recovery.
 
-`mysqlbinlog --stop-datetime` interprets timestamps in the timezone of the machine where `mysqlbinlog` runs. The service detects the Docker container offset in Docker mode and converts the requested timestamp before invoking mysqlbinlog.
+`mysqlbinlog --stop-datetime` interprets timestamps in the timezone of the machine where `mysqlbinlog` runs. In Docker source mode the service asks the source container to render the requested epoch in the container timezone (including the target date's DST rules) before invoking `mysqlbinlog`. The CLI treats the requested second as inclusive: a target of `14:37:12` includes events timestamped `14:37:12` and excludes later seconds.
 
 ## Requirements
 
@@ -148,6 +153,9 @@ Then edit:
 sudo nano /etc/mysql-backup-service/mysql-backup.conf
 sudo nano /etc/mysql-backup-service/mysql-client.cnf
 sudo chmod 600 /etc/mysql-backup-service/mysql-client.cnf
+# If restore_target is enabled:
+sudo nano /etc/mysql-backup-service/mysql-restore-client.cnf
+sudo chmod 600 /etc/mysql-backup-service/mysql-restore-client.cnf
 ```
 
 Validate configuration only:
@@ -183,12 +191,36 @@ Use a dedicated account instead of `root`. A typical MySQL 8.x starting point is
 CREATE USER 'backup'@'127.0.0.1' IDENTIFIED BY 'CHANGE_ME';
 
 GRANT SELECT, SHOW VIEW, TRIGGER, EVENT,
-      RELOAD, PROCESS,
-      REPLICATION CLIENT, REPLICATION SLAVE
+      RELOAD, REPLICATION CLIENT, REPLICATION SLAVE
 ON *.* TO 'backup'@'127.0.0.1';
 ```
 
-Privileges vary by MySQL version and environment. Restore should use a separate controlled restore account. Row-based `mysqlbinlog` replay can require `BINLOG_ADMIN`, or `REPLICATION_APPLIER` plus the privileges required by the replayed events.
+Privileges vary by MySQL version and environment. With the default `no_tablespaces=true`, `PROCESS` is not needed just for tablespace dumping; disabling that option can change the privilege requirements. Restore should use a separate controlled restore account. Row-based `mysqlbinlog` replay can require `BINLOG_ADMIN`, or `REPLICATION_APPLIER` plus the privileges required by the replayed events.
+
+## Separate Restore Target
+
+For production recovery, especially PITR, configure a destination independently from the backup Source:
+
+```ini
+[restore_target]
+enabled = true
+mode = native
+host = 10.10.10.50
+port = 3306
+user = restore
+defaults_extra_file = /etc/mysql-backup-service/mysql-restore-client.cnf
+password =
+```
+
+`[mysql]` always remains the backup/binlog **Source**. When `restore_target.enabled=true`, Full/Diff/PITR SQL is written to `[restore_target]`. When it is false, Restore falls back to `[mysql]`; that is intentionally supported for backward compatibility but means `restore --yes` writes to the Source connection.
+
+Keep restore credentials separate and restrictive:
+
+```bash
+sudo chmod 600 /etc/mysql-backup-service/mysql-restore-client.cnf
+```
+
+Docker targets are also supported with `mode=docker` and a separate `container=` name. `doctor` checks the Restore Target connection when it is enabled.
 
 ## Per-database policies
 
@@ -198,6 +230,7 @@ Global defaults:
 [schedule]
 full = 0 2 * * *
 diff = 0 * * * *
+retry_cooldown_seconds = 300
 
 [retention]
 full_days = 30
@@ -255,7 +288,9 @@ Behavior:
 
 ### Safety restriction
 
-A database with table-level exclusions **must use `diff_schedule = off`**. `mysqlbinlog` database filtering can safely scope row-based replay to a database, but executable row-event replay does not provide a reliable general table-exclusion mechanism. Allowing a Full backup to omit a table and then replaying that table's row events could create a broken recovery chain, so `config-test` rejects that configuration.
+A database with table-level exclusions **must use `diff_schedule = off`**. `mysqlbinlog` database filtering can scope row-based DML replay to a database, but executable row-event replay does not provide a reliable general table-exclusion mechanism. Allowing a Full backup to omit a table and then replaying that table's events could create a broken recovery chain, so `config-test` rejects that configuration. `restore --to-time` also refuses PITR when the selected Full manifest shows table exclusions or schema-only tables.
+
+MySQL always logs DDL as statements even when `binlog_format=ROW`; database filtering for those statement events follows MySQL's default-database rules. Avoid cross-database/fully-qualified DDL patterns that rely on a different default database if you require isolated per-database Diff recovery.
 
 ## Encryption at rest
 
@@ -297,6 +332,8 @@ openssl_passphrase_file = /etc/mysql-backup-service/backup.passphrase
 openssl_pbkdf2_iterations = 200000
 ```
 
+The OpenSSL cipher/KDF parameters and PBKDF2 iteration count are stored in each backup manifest, so changing the current iteration setting later does not make older v2.1 backups undecipherable. Keep the corresponding passphrase available for the lifetime of those backups.
+
 ```bash
 sudo chmod 600 /etc/mysql-backup-service/backup.passphrase
 ```
@@ -331,7 +368,7 @@ The rclone remote itself should be configured outside the Git repository:
 rclone config
 ```
 
-### Atomic remote publication
+### Staged remote publication / completion marker
 
 For every backup bundle the service:
 
@@ -341,7 +378,7 @@ For every backup bundle the service:
 4. applies Object Lock when configured
 5. publishes the JSON manifest **last**
 
-Consumers can therefore treat the final `.json` manifest as the completion marker.
+Consumers can therefore treat the final `.json` manifest as the service-level completion marker. On object stores such as S3, `moveto` may be implemented as copy+delete rather than a backend-atomic rename; correctness comes from publishing the manifest last, not from assuming a POSIX-style atomic rename. Final remote object sizes are verified again after promotion. If a Full's earlier remote publication failed, the next Diff checks for the base Full's remote manifest and idempotently republishes that Full bundle before publishing the dependent Diff.
 
 ## S3 / MinIO Object Lock
 
@@ -497,6 +534,8 @@ sudo mysql-backup-service backup --type full --database appdb
 
 ### Restore latest chain
 
+For DR, enable `[restore_target]` first. If it is disabled, the command writes to the `[mysql]` Source connection. Restore remains destructive and requires `--yes`.
+
 ```bash
 sudo mysql-backup-service restore --database appdb --latest --yes
 ```
@@ -597,19 +636,22 @@ The service is intentionally fail-closed in recovery-critical situations:
 
 - local in-progress backups use `.partial`
 - remote uploads use random `.partial.<id>` keys
-- checksum/manifest creation happens after the data file is finalized
-- remote manifest is finalized last
+- SHA-256 sidecar creation happens after the data file is durable, and the local JSON manifest is committed last as the local completion marker
+- remote manifest is finalized last and acts as the completion marker
+- failed scheduled jobs are isolated per database and retried after `schedule.retry_cooldown_seconds` instead of retrying every poll or starving the remaining queue
 - failed command output never becomes a successful backup
 - Diff refuses to run if its base binlog is unavailable unless configured to create a fresh Full
 - table-filtered Full policies cannot be combined with Diff/PITR
-- exact PITR refuses to run if its source base binary log has expired
+- exact PITR refuses future targets, rejects `--diff` + `--to-time`, rejects table-filtered Fulls, and refuses to run if its source base binary log has expired
 - restore validates the selected Full/Diff relationship
+- PITR reads binlogs from the Source but can write to an independent Restore Target
+- final backup/manifest files are fsync'd before success is reported, and manual CLI execution enforces a restrictive `077` umask
 - one filesystem lock prevents overlapping backup/restore operations
 
 ## Security recommendations
 
 - Do not commit database passwords, encryption keys, passphrases, rclone configs, or AWS credentials.
-- Keep credential/key files `0600`.
+- Keep credential/key files `0600`; manual CLI runs also force `umask 077` for newly created backup/state/log files.
 - Prefer a dedicated least-privilege MySQL backup user.
 - Keep encryption private keys separate from the backup volume where possible.
 - Keep at least one backup copy off-host.
@@ -650,7 +692,7 @@ python3 mysql_backup_service.py --config mysql-backup.conf.example config-test
 python3 mysql_backup_service.py version
 ```
 
-GitHub Actions runs syntax, unit, configuration, and CLI smoke tests on pushes and pull requests.
+GitHub Actions tests Python 3.8, 3.11, and 3.13 and also runs an end-to-end Docker integration covering encrypted Full + Diff backup, rclone remote publication, restore into a separate MySQL target, and exact PITR.
 
 ## License
 

@@ -1,0 +1,8 @@
+# Keep this file mode 0600.
+# RESTORE TARGET credentials. Use a dedicated controlled account with the
+# privileges required to create/alter/drop objects and replay binlog events.
+[client]
+user=restore
+password=CHANGE_ME
+host=127.0.0.1
+port=3306

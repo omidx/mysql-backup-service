@@ -1,48 +1,63 @@
-name: Audit Bootstrap
+name: CI
 
 on:
   push:
-    branches:
-      - feature/v2.1-production-features
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply-audit-snapshot:
+  unit:
+    name: Unit / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.8', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Python syntax
+        run: python -m py_compile mysql_backup_service.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Config smoke test
+        run: python mysql_backup_service.py --config mysql-backup.conf.example config-test
+      - name: CLI smoke tests
+        run: |
+          python mysql_backup_service.py --help >/dev/null
+          test "$(python mysql_backup_service.py version)" = "2.1.0"
+
+  shell:
+    name: Shell / systemd syntax
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: feature/v2.1-production-features
-          fetch-depth: 0
-      - name: Reconstruct audited delta
-        shell: bash
+      - name: Bash syntax
         run: |
-          set -Eeuo pipefail
-          cat .audit-staging/part-* > /tmp/audit-delta.tar.gz
-          mkdir -p /tmp/audit-delta
-          tar -xzf /tmp/audit-delta.tar.gz -C /tmp/audit-delta
-          patch -p1 --forward --batch < /tmp/audit-delta/core.patch
-          cp -a /tmp/audit-delta/files/. .
-          rm -rf .audit-staging
-      - name: Validate audited snapshot before commit
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          python3 -m py_compile mysql_backup_service.py
-          python3 -m unittest discover -s tests -v
-          python3 mysql_backup_service.py --config mysql-backup.conf.example config-test
-          test "$(python3 mysql_backup_service.py version)" = "2.1.0"
           bash -n backup_script.sh
           bash -n install.sh
           bash -n tests/integration.sh
-      - name: Commit audited snapshot
-        shell: bash
+      - name: systemd unit syntax
         run: |
-          set -Eeuo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Audit v2.1 backup and restore pipeline"
-          git push origin HEAD:feature/v2.1-production-features
+          sudo install -m 0755 backup_script.sh /usr/local/bin/mysql-backup-service
+          systemd-analyze verify backup_service.service
+
+  integration:
+    name: MySQL 8.4 end-to-end recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+      - name: Run Docker integration
+        run: tests/integration.sh

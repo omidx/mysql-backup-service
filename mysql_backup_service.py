@@ -27,7 +27,6 @@ import datetime as dt
 import fcntl
 import gzip
 import hashlib
-import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -44,12 +43,12 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
-from typing import BinaryIO, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import BinaryIO, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib import request as urllib_request
 
 VERSION = "2.1.0"
 DEFAULT_CONFIG = "/etc/mysql-backup-service/mysql-backup.conf"
-SYSTEM_DATABASES = {"information_schema", "performance_schema"}
+SYSTEM_DATABASES = {"information_schema", "performance_schema", "sys"}
 LOG = logging.getLogger("mysql-backup-service")
 STOP_REQUESTED = False
 
@@ -71,19 +70,35 @@ def timestamp_for_file(value: Optional[dt.datetime] = None) -> str:
 
 
 def parse_iso(value: str) -> dt.datetime:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
     try:
-        parsed = dt.datetime.fromisoformat(value)
+        parsed = dt.datetime.fromisoformat(text)
     except ValueError as exc:
         raise BackupError(f"invalid datetime {value!r}; use ISO format such as 2026-09-20 14:37:12") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=now_local().tzinfo)
+        # Interpret naive input as local wall-clock time at *that historical date*.
+        # Using now_local().tzinfo would freeze today's UTC offset and can be wrong
+        # across DST transitions. time.mktime() asks the OS timezone database to
+        # resolve the supplied local date/time instead.
+        try:
+            epoch = time.mktime(parsed.timetuple()) + parsed.microsecond / 1_000_000
+            parsed = dt.datetime.fromtimestamp(epoch).astimezone()
+        except (OverflowError, OSError, ValueError) as exc:
+            raise BackupError(f"datetime is outside the supported local-time range: {value!r}") from exc
     return parsed
 
 
 def parse_bool(value: Optional[str], default: bool = False) -> bool:
     if value is None:
         return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    raise BackupError(f"invalid boolean value: {value!r}")
 
 
 def csv_list(value: str) -> List[str]:
@@ -102,9 +117,16 @@ def safe_db_dir(name: str) -> str:
 
 
 def validate_mysql_identifier(value: str, label: str = "identifier") -> str:
-    # We pass database/table names as command arguments, not SQL fragments, but
-    # still reject control characters and path-like values early.
-    if not value or any(ord(ch) < 32 for ch in value) or "/" in value or "\\" in value:
+    # Database/table names are passed as command arguments. Reject control
+    # characters, path-like values, and option-looking names so a legitimate
+    # MySQL identifier can never be reinterpreted as a client CLI flag.
+    if (
+        not value
+        or value.startswith("-")
+        or any(ord(ch) < 32 for ch in value)
+        or "/" in value
+        or "\\" in value
+    ):
         raise BackupError(f"invalid MySQL {label}: {value!r}")
     return value
 
@@ -135,6 +157,27 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def fsync_file(path: Path) -> None:
+    with path.open("rb") as fh:
+        os.fsync(fh.fileno())
+
+
+def fsync_directory(path: Path) -> None:
+    # Directory fsync makes rename/create metadata durable across sudden power
+    # loss on filesystems that support it. Some network filesystems reject it;
+    # that should not invalidate an otherwise complete backup.
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def atomic_json_write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
@@ -145,6 +188,7 @@ def atomic_json_write(path: Path, payload: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_name, path)
+        fsync_directory(path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
@@ -159,6 +203,7 @@ def atomic_text_write(path: Path, text: str) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_name, path)
+        fsync_directory(path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
@@ -235,6 +280,67 @@ class Settings:
         return parse_bool(self.db_get(db, key, global_section, global_key, str(default)), default)
 
     def validate(self) -> None:
+        # Parse every supported boolean up front so typos such as `treu` fail
+        # config-test instead of silently disabling a safety feature.
+        boolean_options = [
+            ("general", "verify_after_backup", True),
+            ("general", "verify_before_restore", True),
+            ("general", "write_sha256_file", True),
+            ("general", "stop_on_database_error", False),
+            ("mysql", "set_gtid_purged_off", True),
+            ("mysql", "no_tablespaces", True),
+            ("mysql", "add_drop_database", True),
+            ("schedule", "full_on_start_if_missing", True),
+            ("diff", "enabled", True),
+            ("diff", "filter_by_database", True),
+            ("diff", "require_row_binlog", True),
+            ("encryption", "enabled", False),
+            ("remote", "enabled", False),
+            ("remote", "prune_with_local", False),
+            ("object_lock", "enabled", False),
+            ("restore_test", "enabled", False),
+            ("notifications", "on_success", False),
+            ("notifications", "on_failure", True),
+        ]
+        if self.p.has_section("restore_target"):
+            boolean_options.append(("restore_target", "enabled", False))
+        for section, key, default in boolean_options:
+            self.getbool(section, key, default)
+
+        if self.getint("schedule", "poll_seconds", 20) < 1:
+            raise BackupError("schedule.poll_seconds must be >= 1")
+        if self.getint("schedule", "retry_cooldown_seconds", 300) < 0:
+            raise BackupError("schedule.retry_cooldown_seconds must be >= 0")
+        if self.getint("retention", "full_days", 30) < 0 or self.getint("retention", "diff_days", 14) < 0:
+            raise BackupError("retention days must be >= 0")
+        if self.getint("retention", "minimum_full_backups", 2) < 0:
+            raise BackupError("retention.minimum_full_backups must be >= 0")
+        for key in ("gfs_daily", "gfs_weekly", "gfs_monthly"):
+            if self.getint("retention", key, 0) < 0:
+                raise BackupError(f"retention.{key} must be >= 0")
+        if self.getint("remote", "retries", 3) < 1:
+            raise BackupError("remote.retries must be >= 1")
+        if self.getfloat("throttle", "local_stream_mbps", 0.0) < 0:
+            raise BackupError("throttle.local_stream_mbps must be >= 0")
+        io_class = self.getint("throttle", "ionice_class", 0)
+        if io_class not in {0, 1, 2, 3}:
+            raise BackupError("throttle.ionice_class must be 0, 1, 2, or 3")
+        if not 0 <= self.getint("throttle", "ionice_level", 7) <= 7:
+            raise BackupError("throttle.ionice_level must be between 0 and 7")
+        if not -20 <= self.getint("throttle", "nice", 0) <= 19:
+            raise BackupError("throttle.nice must be between -20 and 19")
+        if self.getint("restore_test", "startup_timeout_seconds", 120) < 1:
+            raise BackupError("restore_test.startup_timeout_seconds must be >= 1")
+
+        for section in ("mysql", "restore_target"):
+            if section == "restore_target" and not self.p.has_section(section):
+                continue
+            mode = self.get(section, "mode", self.get("mysql", "mode", "native")).lower()
+            if mode not in {"native", "docker"}:
+                raise BackupError(f"{section}.mode must be native or docker")
+            self.getint(section, "port", self.getint("mysql", "port", 3306))
+            self.getint(section, "container_port", self.getint("mysql", "container_port", 3306))
+
         # Validate global schedules.
         for key in ("full", "diff"):
             expr = self.get("schedule", key, "off")
@@ -259,6 +365,8 @@ class Settings:
                 raise BackupError("GPG encryption requires encryption.gpg_recipient")
             if provider == "openssl" and not self.get("encryption", "openssl_passphrase_file", ""):
                 raise BackupError("OpenSSL encryption requires encryption.openssl_passphrase_file")
+            if provider == "openssl" and self.getint("encryption", "openssl_pbkdf2_iterations", 200000) < 1:
+                raise BackupError("encryption.openssl_pbkdf2_iterations must be >= 1")
 
         if self.getbool("remote", "enabled", False):
             if self.get("remote", "backend", "rclone").lower() != "rclone":
@@ -281,7 +389,7 @@ class Settings:
         global_schema_only = set(csv_list(self.get("tables", "schema_only_tables", "")))
         if global_excluded & global_schema_only:
             raise BackupError("tables: a table cannot be both excluded and schema-only")
-        if (global_excluded or global_schema_only) and self.get("schedule", "diff", "off").lower() != "off":
+        if (global_excluded or global_schema_only) and self.getbool("diff", "enabled", True) and self.get("schedule", "diff", "off").lower() != "off":
             raise BackupError(
                 "global table exclusion/schema-only policy requires schedule.diff=off; "
                 "use per-database table policy with diff_schedule=off when only selected databases need it"
@@ -289,6 +397,11 @@ class Settings:
 
         for db in self.database_sections():
             validate_mysql_identifier(db, "database name")
+            if self.p.has_option(self.database_section(db), "enabled"):
+                self.getbool(self.database_section(db), "enabled", True)
+            for key in ("full_days", "diff_days", "minimum_full_backups", "gfs_daily", "gfs_weekly", "gfs_monthly"):
+                if self.p.has_option(self.database_section(db), key) and self.db_getint(db, key, "retention", key, 0) < 0:
+                    raise BackupError(f"database:{db}.{key} must be >= 0")
             for key, global_section in (("full_schedule", "schedule"), ("diff_schedule", "schedule")):
                 global_key = "full" if key.startswith("full") else "diff"
                 expr = self.db_get(db, key, global_section, global_key, "off")
@@ -302,7 +415,7 @@ class Settings:
             for table in excluded | schema_only:
                 validate_mysql_identifier(table, "table name")
             diff_expr = self.db_get(db, "diff_schedule", "schedule", "diff", "off")
-            if (excluded or schema_only) and diff_expr.lower() != "off":
+            if (excluded or schema_only) and self.getbool("diff", "enabled", True) and diff_expr.lower() != "off":
                 raise BackupError(
                     f"database:{db}: table exclusion/schema-only policies require diff_schedule=off; "
                     "mysqlbinlog cannot safely exclude individual tables from executable row-event replay"
@@ -403,13 +516,16 @@ class CronField:
                 raise BackupError(f"invalid cron step: {part!r}") from exc
             if step <= 0:
                 raise BackupError(f"invalid cron step: {step}")
-            if base == "*":
-                start, end = self.minimum, self.maximum
-            elif "-" in base:
-                a, b = base.split("-", 1)
-                start, end = int(a), int(b)
-            else:
-                start = end = int(base)
+            try:
+                if base == "*":
+                    start, end = self.minimum, self.maximum
+                elif "-" in base:
+                    a, b = base.split("-", 1)
+                    start, end = int(a), int(b)
+                else:
+                    start = end = int(base)
+            except ValueError as exc:
+                raise BackupError(f"invalid cron value: {part!r}") from exc
             if start > end:
                 raise BackupError("cron ranges may not wrap around")
             for n in range(start, end + 1, step):
@@ -506,20 +622,38 @@ def copy_limited(src: BinaryIO, dst: BinaryIO, mbps: float = 0.0, chunk_size: in
 
 
 class MySQLClient:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, section: str = "mysql"):
         self.s = settings
-        self.mode = self.s.get("mysql", "mode", "native").lower()
+        requested_section = section
+        if section != "mysql" and (not self.s.p.has_section(section) or not self.s.getbool(section, "enabled", False)):
+            section = "mysql"
+        self.section = section
+        self.requested_section = requested_section
+        self.uses_fallback = requested_section != "mysql" and section == "mysql"
+
+        def cfg(key: str, default: str = "") -> str:
+            if section != "mysql" and self.s.p.has_option(section, key):
+                return self.s.get(section, key, default)
+            return self.s.get("mysql", key, default)
+
+        def cfg_int(key: str, default: int) -> int:
+            if section != "mysql" and self.s.p.has_option(section, key):
+                return self.s.getint(section, key, default)
+            return self.s.getint("mysql", key, default)
+
+        self._cfg = cfg
+        self.mode = cfg("mode", "native").lower()
         if self.mode not in {"native", "docker"}:
-            raise BackupError("mysql.mode must be native or docker")
-        self.host = self.s.get("mysql", "host", "127.0.0.1")
-        self.port = self.s.getint("mysql", "port", 3306)
-        self.socket = self.s.get("mysql", "socket", "")
-        self.user = self.s.get("mysql", "user", "backup")
-        self.password = self.s.get("mysql", "password", "")
-        self.defaults_file = self.s.get("mysql", "defaults_extra_file", "")
-        self.container = self.s.get("mysql", "container", "mysql")
-        self.container_host = self.s.get("mysql", "container_host", "127.0.0.1")
-        self.container_port = self.s.getint("mysql", "container_port", 3306)
+            raise BackupError(f"{section}.mode must be native or docker")
+        self.host = cfg("host", "127.0.0.1")
+        self.port = cfg_int("port", 3306)
+        self.socket = cfg("socket", "")
+        self.user = cfg("user", "backup")
+        self.password = cfg("password", "")
+        self.defaults_file = cfg("defaults_extra_file", "")
+        self.container = cfg("container", "mysql")
+        self.container_host = cfg("container_host", "127.0.0.1")
+        self.container_port = cfg_int("container_port", 3306)
         self._dump_help: Optional[str] = None
 
     def _priority_prefix(self) -> List[str]:
@@ -559,7 +693,12 @@ class MySQLClient:
 
     @staticmethod
     def run(args: Sequence[str], env: Optional[dict] = None, check: bool = True, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
-        proc = subprocess.run(list(args), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        try:
+            proc = subprocess.run(list(args), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        except FileNotFoundError as exc:
+            raise BackupError(f"required executable not found: {args[0]}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise BackupError(f"command timed out after {timeout}s: {args[0]}") from exc
         if check and proc.returncode != 0:
             detail = proc.stderr.strip() or proc.stdout.strip()
             raise BackupError(f"command failed ({proc.returncode}): {detail}")
@@ -584,7 +723,7 @@ class MySQLClient:
     def databases(self) -> List[str]:
         rows = self.query("SHOW DATABASES")
         include = csv_list(self.s.get("mysql", "include_databases", "*")) or ["*"]
-        exclude = set(csv_list(self.s.get("mysql", "exclude_databases", "information_schema,performance_schema,sys")))
+        exclude = set(csv_list(self.s.get("mysql", "exclude_databases", "information_schema,performance_schema,sys,mysql")))
         found = [r[0] for r in rows if r and r[0] not in SYSTEM_DATABASES and r[0] not in exclude]
         if include != ["*"]:
             allowed = set(include)
@@ -629,7 +768,7 @@ class MySQLClient:
             args.append("--no-tablespaces")
         if need_coordinates:
             args.append(self.source_data_option())
-        if self.s.getbool("mysql", "add_drop_database", False):
+        if self.s.getbool("mysql", "add_drop_database", True) and database not in {"mysql", "information_schema", "performance_schema", "sys"}:
             args.append("--add-drop-database")
         for table in ignore_tables:
             args.append(f"--ignore-table={database}.{validate_mysql_identifier(table, 'table')}")
@@ -640,6 +779,7 @@ class MySQLClient:
         return args, env
 
     def schema_only_command(self, database: str, tables: Sequence[str]) -> Tuple[List[str], dict]:
+        validate_mysql_identifier(database, "database")
         args, env = self._base_tool("mysqldump")
         help_text = self.dump_help()
         args += ["--no-data", "--triggers", "--hex-blob", "--default-character-set=utf8mb4"]
@@ -652,6 +792,7 @@ class MySQLClient:
         return args, env
 
     def mysqlbinlog_command(self, database: str, logs: Sequence[str], start_position: Optional[int] = None, stop_position: Optional[int] = None, stop_datetime: Optional[str] = None, to_last_log: bool = False) -> Tuple[List[str], dict]:
+        validate_mysql_identifier(database, "database")
         args, env = self._base_tool("mysqlbinlog", for_binlog=True)
         args += ["--read-from-remote-server", "--verify-binlog-checksum"]
         if self.s.getbool("diff", "filter_by_database", True):
@@ -673,22 +814,28 @@ class MySQLClient:
     def mysql_restore_command(self) -> Tuple[List[str], dict]:
         args, env = self._base_tool("mysql", priority=False)
         args.append("--binary-mode")
-        extra = self.s.get("mysql", "mysql_extra_args", "")
+        extra = self._cfg("mysql_extra_args", "")
         if extra:
             args += shlex.split(extra)
         return args, env
 
-    def mysqlbinlog_timezone(self) -> dt.tzinfo:
+    def mysqlbinlog_timezone(self, when: Optional[dt.datetime] = None) -> dt.tzinfo:
         # mysqlbinlog interprets --stop-datetime in the local timezone of the
-        # machine/container where the utility runs, not the server timezone.
+        # machine/container where the utility runs. Resolve the offset at the
+        # requested historical instant so DST transitions are handled correctly.
+        when = when or now_local()
         if self.mode == "native":
-            return now_local().tzinfo or dt.timezone.utc
-        proc = self.run(["docker", "exec", self.container, "date", "+%z"], check=False)
+            return dt.datetime.fromtimestamp(when.timestamp()).astimezone().tzinfo or dt.timezone.utc
+        epoch = int(when.timestamp())
+        proc = self.run(["docker", "exec", self.container, "date", "-d", f"@{epoch}", "+%z"], check=False)
+        if proc.returncode != 0:
+            LOG.warning("Container date does not support historical offset lookup; using its current UTC offset")
+            proc = self.run(["docker", "exec", self.container, "date", "+%z"], check=False)
         text = proc.stdout.strip() if proc.returncode == 0 else ""
         match = re.fullmatch(r"([+-])(\d{2})(\d{2})", text)
         if not match:
             LOG.warning("Could not determine mysqlbinlog container timezone; using host local timezone")
-            return now_local().tzinfo or dt.timezone.utc
+            return dt.datetime.fromtimestamp(when.timestamp()).astimezone().tzinfo or dt.timezone.utc
         sign = 1 if match.group(1) == "+" else -1
         minutes = sign * (int(match.group(2)) * 60 + int(match.group(3)))
         return dt.timezone(dt.timedelta(minutes=minutes))
@@ -733,7 +880,14 @@ class EncryptionManager:
         return {"age": "age", "gpg": "gpg", "openssl": "openssl"}[self.provider]
 
     def metadata(self) -> dict:
-        return {"enabled": self.enabled, "provider": self.provider if self.enabled else "none"}
+        metadata = {"enabled": self.enabled, "provider": self.provider if self.enabled else "none"}
+        if self.enabled and self.provider == "openssl":
+            metadata.update({
+                "cipher": "aes-256-cbc",
+                "kdf": "pbkdf2",
+                "pbkdf2_iterations": self.s.getint("encryption", "openssl_pbkdf2_iterations", 200000),
+            })
+        return metadata
 
     def encrypt(self, source: Path, destination_partial: Path) -> None:
         if not self.enabled:
@@ -776,11 +930,20 @@ class EncryptionManager:
             cmd += ["--decrypt", str(source)]
         elif provider == "openssl":
             passfile = self.s.get("encryption", "openssl_passphrase_file", "")
-            iterations = self.s.getint("encryption", "openssl_pbkdf2_iterations", 200000)
+            cipher = str((metadata or {}).get("cipher", "aes-256-cbc")).lower()
+            kdf = str((metadata or {}).get("kdf", "pbkdf2")).lower()
+            if cipher != "aes-256-cbc" or kdf != "pbkdf2":
+                raise BackupError(f"unsupported OpenSSL backup parameters: cipher={cipher}, kdf={kdf}")
+            iterations = int((metadata or {}).get("pbkdf2_iterations", self.s.getint("encryption", "openssl_pbkdf2_iterations", 200000)))
+            if iterations < 1:
+                raise BackupError("invalid OpenSSL PBKDF2 iteration count in backup metadata")
             cmd = ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", str(iterations), "-pass", f"file:{passfile}", "-in", str(source)]
         else:
             raise BackupError(f"unsupported backup encryption provider: {provider}")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError as exc:
+            raise BackupError(f"required executable not found: {cmd[0]}") from exc
         assert proc.stdout is not None
         try:
             yield proc.stdout
@@ -873,24 +1036,66 @@ class RemoteStore:
         if cmd:
             MySQLClient.run(cmd)
 
+    def _remote_size_matches(self, remote_path: str, expected: int) -> bool:
+        proc = self._rclone("lsjson", remote_path, "--stat", check=False)
+        if proc.returncode != 0:
+            return False
+        try:
+            payload = json.loads(proc.stdout)
+            return int(payload["Size"]) == expected
+        except Exception:
+            return False
+
+    def bundle_complete(self, data_path: Path) -> bool:
+        if not self.enabled:
+            return True
+        manifest = Path(str(data_path) + ".json")
+        if not manifest.exists():
+            return False
+        return self._remote_size_matches(self.remote_path(self.relative_key(manifest)), manifest.stat().st_size)
+
+    def ensure_bundle(self, data_path: Path) -> None:
+        if not self.enabled or self.bundle_complete(data_path):
+            return
+        manifest = Path(str(data_path) + ".json")
+        if not manifest.exists():
+            raise BackupError(f"cannot publish remote bundle without local manifest: {manifest}")
+        sha = Path(str(data_path) + ".sha256")
+        bundle = [data_path] + ([sha] if sha.exists() else []) + [manifest]
+        LOG.warning("Remote completion marker missing; republishing base backup bundle: %s", data_path)
+        self.upload_bundle(bundle)
+
     def upload_bundle(self, paths: Sequence[Path]) -> None:
         if not self.enabled:
             return
-        # Manifest is deliberately finalized last. Its presence acts as a commit
-        # marker for a complete remote backup bundle.
-        ordered = sorted(paths, key=lambda p: 1 if p.name.endswith(".json") else 0)
+        manifests = [p for p in paths if p.name.endswith(".json")]
+        if len(manifests) != 1:
+            raise BackupError("remote backup bundle must contain exactly one manifest")
+        manifest = manifests[0]
+        ordered = [p for p in paths if p != manifest] + [manifest]
         staged: List[Tuple[Path, str, str]] = []
+        finalized: List[Tuple[Path, str]] = []
         token = uuid.uuid4().hex[:12]
         try:
+            # Staging objects are intentionally not completion markers. On S3
+            # backends moveto may be implemented as copy+delete rather than an
+            # atomic rename, so correctness relies on manifest-last publication.
             for path in ordered:
                 rel = self.relative_key(path)
                 final = self.remote_path(rel)
+                if self._remote_size_matches(final, path.stat().st_size):
+                    self.apply_object_lock(rel)
+                    LOG.info("Remote object already present with matching size: %s", final)
+                    continue
                 partial = final + f".partial.{token}"
                 self._rclone("copyto", str(path), partial)
                 self._verify_remote_size(partial, path.stat().st_size)
                 staged.append((path, partial, final))
+
             for path, partial, final in staged:
                 self._rclone("moveto", partial, final)
+                self._verify_remote_size(final, path.stat().st_size)
+                finalized.append((path, final))
                 rel = self.relative_key(path)
                 self.apply_object_lock(rel)
                 LOG.info("Remote upload finalized: %s", final)
@@ -898,6 +1103,12 @@ class RemoteStore:
             for _, partial, _ in staged:
                 with contextlib.suppress(Exception):
                     self._rclone("deletefile", partial, check=False)
+            # Best-effort rollback. Object Lock may intentionally prevent deleting
+            # payload objects; without the final manifest they are not considered
+            # a complete backup bundle.
+            for path, final in reversed(finalized):
+                with contextlib.suppress(Exception):
+                    self._rclone("deletefile", final, check=False)
             raise
 
     def delete_local_counterpart(self, path: Path) -> None:
@@ -912,7 +1123,8 @@ class RemoteStore:
 class BackupManager:
     def __init__(self, settings: Settings):
         self.s = settings
-        self.mysql = MySQLClient(settings)
+        self.mysql = MySQLClient(settings, "mysql")
+        self.restore_mysql = MySQLClient(settings, "restore_target")
         self.state = StateStore(settings)
         self.root = settings.backup_root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -946,7 +1158,19 @@ class BackupManager:
         discovered = set(self.mysql.databases())
         explicit = set(self.s.database_sections())
         selected = sorted(discovered | explicit)
-        return [db for db in selected if db in discovered and self.policy(db).enabled]
+        result: List[str] = []
+        for db in selected:
+            if db in discovered and self.policy(db).enabled:
+                result.append(validate_mysql_identifier(db, "database"))
+        return result
+
+    @staticmethod
+    def _unique_plain_path(folder: Path, filename: str) -> Path:
+        candidate = folder / filename
+        if not any(folder.glob(candidate.name + "*")):
+            return candidate
+        stem = candidate.name[:-7] if candidate.name.endswith(".sql.gz") else candidate.stem
+        return folder / f"{stem}__{secrets.token_hex(4)}.sql.gz"
 
     def check_free_space(self) -> None:
         usage = shutil.disk_usage(self.root)
@@ -983,10 +1207,16 @@ class BackupManager:
             with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=self.s.getint("general", "gzip_level", 6), mtime=0) as gz:
                 if prefix:
                     gz.write(prefix)
-                proc = subprocess.Popen(list(args), env=env, stdout=subprocess.PIPE, stderr=err)
+                try:
+                    proc = subprocess.Popen(list(args), env=env, stdout=subprocess.PIPE, stderr=err)
+                except FileNotFoundError as exc:
+                    raise BackupError(f"required executable not found: {args[0]}") from exc
                 assert proc.stdout is not None
+                stream_error: Optional[Exception] = None
                 try:
                     copy_limited(proc.stdout, gz, rate)
+                except Exception as exc:
+                    stream_error = exc
                 finally:
                     proc.stdout.close()
                 rc = proc.wait()
@@ -994,6 +1224,10 @@ class BackupManager:
                 err.seek(0)
                 detail = err.read().decode("utf-8", errors="replace").strip()
                 raise BackupError(f"backup command failed ({rc}): {detail}")
+            if stream_error is not None:
+                if isinstance(stream_error, BackupError):
+                    raise stream_error
+                raise BackupError(f"failed while writing backup stream: {stream_error}") from stream_error
 
     def _finalize_plain_backup(self, plain_gz: Path, final_base: Path, manifest: dict) -> Tuple[Path, Path, Optional[Path]]:
         final_path = Path(str(final_base) + self.encryption.extension)
@@ -1001,9 +1235,12 @@ class BackupManager:
         try:
             if self.encryption.enabled:
                 self.encryption.encrypt(plain_gz, final_partial)
+                fsync_file(final_partial)
                 os.replace(final_partial, final_path)
             else:
                 os.replace(plain_gz, final_path)
+            fsync_file(final_path)
+            fsync_directory(final_path.parent)
             digest = sha256_file(final_path)
             manifest.update({
                 "version": VERSION,
@@ -1012,13 +1249,15 @@ class BackupManager:
                 "sha256": digest,
                 "encryption": self.encryption.metadata(),
             })
-            manifest_path = Path(str(final_path) + ".json")
-            atomic_json_write(manifest_path, manifest)
             sha_path: Optional[Path] = None
             if self.s.getbool("general", "write_sha256_file", True):
                 sha_path = Path(str(final_path) + ".sha256")
                 atomic_text_write(sha_path, f"{digest}  {final_path.name}\n")
-            bundle = [final_path, manifest_path] + ([sha_path] if sha_path else [])
+            # The manifest is the local and remote completion marker and is
+            # therefore written/published last.
+            manifest_path = Path(str(final_path) + ".json")
+            atomic_json_write(manifest_path, manifest)
+            bundle = [final_path] + ([sha_path] if sha_path else []) + [manifest_path]
             self.remote.upload_bundle(bundle)
             return final_path, manifest_path, sha_path
         finally:
@@ -1053,10 +1292,28 @@ class BackupManager:
         if expected_type and manifest.get("type") != expected_type:
             raise BackupError(f"backup type mismatch: expected {expected_type}, backup is {manifest.get('type')}")
         expected_hash = manifest.get("sha256")
-        if expected_hash:
+        sidecar = self.sha_path(path)
+        sidecar_hash: Optional[str] = None
+        if sidecar.exists():
+            try:
+                parts = sidecar.read_text(encoding="utf-8").strip().split()
+                if not parts:
+                    raise ValueError("empty SHA-256 sidecar")
+                sidecar_hash = parts[0].lower()
+                if len(parts) > 1 and parts[-1] != path.name:
+                    raise BackupError(f"SHA-256 sidecar filename mismatch for {path}")
+            except BackupError:
+                raise
+            except Exception as exc:
+                raise BackupError(f"invalid SHA-256 sidecar {sidecar}: {exc}") from exc
+        if expected_hash or sidecar_hash:
             actual = sha256_file(path)
-            if actual != expected_hash:
+            if expected_hash and actual != str(expected_hash).lower():
                 raise BackupError(f"SHA-256 mismatch for {path}")
+            if sidecar_hash and actual != sidecar_hash:
+                raise BackupError(f"SHA-256 sidecar mismatch for {path}")
+            if expected_hash and sidecar_hash and str(expected_hash).lower() != sidecar_hash:
+                raise BackupError(f"manifest/SHA-256 sidecar disagreement for {path}")
         if deep:
             self.encryption.verify_payload(path, manifest.get("encryption", {"enabled": False, "provider": "none"}))
         return manifest
@@ -1068,12 +1325,13 @@ class BackupManager:
         full_dir.mkdir(parents=True, exist_ok=True)
         started = now_local()
         stamp = timestamp_for_file(started)
-        plain_final = full_dir / f"{safe_db_dir(db)}__full__{stamp}.sql.gz"
+        plain_final = self._unique_plain_path(full_dir, f"{safe_db_dir(db)}__full__{stamp}.sql.gz")
         plain_partial = Path(str(plain_final) + ".partial")
         LOG.info("Full backup started: database=%s", db)
         try:
             ignored = sorted(set(policy.exclude_tables) | set(policy.schema_only_tables))
-            args, env = self.mysql.dump_command(db, need_coordinates=self.s.getbool("diff", "enabled", True), ignore_tables=ignored)
+            need_coordinates = self.s.getbool("diff", "enabled", True) and not ignored
+            args, env = self.mysql.dump_command(db, need_coordinates=need_coordinates, ignore_tables=ignored)
             self._stream_command_to_gzip(args, env, plain_partial)
             if policy.schema_only_tables:
                 args, env = self.mysql.schema_only_command(db, policy.schema_only_tables)
@@ -1083,8 +1341,8 @@ class BackupManager:
                 with gzip.open(plain_partial, "rb") as fh:
                     for _ in iter(lambda: fh.read(1024 * 1024), b""):
                         pass
-            coords = parse_dump_coordinates(plain_partial) if self.s.getbool("diff", "enabled", True) else None
-            if self.s.getbool("diff", "enabled", True) and not coords:
+            coords = parse_dump_coordinates(plain_partial) if need_coordinates else None
+            if need_coordinates and not coords:
                 raise BackupError("full backup did not contain binary-log coordinates")
             manifest = {
                 "type": "full",
@@ -1119,7 +1377,12 @@ class BackupManager:
             data_path = Path(str(mp)[:-5])
             if data_path.exists():
                 result.append(data_path)
-        result.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        def sort_key(path: Path) -> dt.datetime:
+            try:
+                return self._manifest_time(self.read_manifest(path), path)
+            except Exception:
+                return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=now_local().tzinfo)
+        result.sort(key=sort_key, reverse=True)
         return result
 
     def latest_full(self, db: str) -> Optional[Path]:
@@ -1161,6 +1424,15 @@ class BackupManager:
             else:
                 raise BackupError(f"no full backup exists for {db}")
         full_manifest = self.read_manifest(full)
+        base_policy = full_manifest.get("policy") or {}
+        if base_policy.get("exclude_tables") or base_policy.get("schema_only_tables"):
+            LOG.warning("Latest Full for %s was table-filtered; creating a new unfiltered Full before Diff", db)
+            full = self.create_full(db)
+            full_manifest = self.read_manifest(full)
+        # If an earlier remote upload failed after the local Full committed, do
+        # not publish a Diff that references a missing remote base. Republish
+        # the Full idempotently first.
+        self.remote.ensure_bundle(full)
         coord = full_manifest.get("binlog") or {}
         start_file, start_pos = coord.get("file"), coord.get("position")
         if not start_file or not start_pos:
@@ -1187,7 +1459,7 @@ class BackupManager:
         started = now_local()
         stamp = timestamp_for_file(started)
         base_tag = full.name.replace(".sql.gz", "").replace(".age", "").replace(".gpg", "").replace(".enc", "")
-        plain_final = diff_dir / f"{safe_db_dir(db)}__diff__{stamp}__base-{base_tag}.sql.gz"
+        plain_final = self._unique_plain_path(diff_dir, f"{safe_db_dir(db)}__diff__{stamp}__base-{base_tag}.sql.gz")
         plain_partial = Path(str(plain_final) + ".partial")
         LOG.info("Diff backup started: database=%s base=%s", db, full.name)
         try:
@@ -1242,8 +1514,13 @@ class BackupManager:
 
     def _restore_streams_to_command(self, command: Sequence[str], env: dict, streams: Sequence[BinaryIO], extra_process: Optional[subprocess.Popen] = None) -> None:
         with tempfile.TemporaryFile() as err:
-            proc = subprocess.Popen(list(command), env=env, stdin=subprocess.PIPE, stderr=err)
+            try:
+                proc = subprocess.Popen(list(command), env=env, stdin=subprocess.PIPE, stderr=err)
+            except FileNotFoundError as exc:
+                raise BackupError(f"required executable not found: {command[0]}") from exc
             assert proc.stdin is not None
+            pipeline_error: Optional[Exception] = None
+            extra_error: Optional[BackupError] = None
             try:
                 for stream in streams:
                     copy_limited(stream, proc.stdin, 0)
@@ -1254,20 +1531,41 @@ class BackupManager:
                     e_stderr = extra_process.stderr.read().decode("utf-8", errors="replace") if extra_process.stderr else ""
                     e_rc = extra_process.wait()
                     if e_rc != 0:
-                        raise BackupError(f"mysqlbinlog PITR failed ({e_rc}): {e_stderr.strip()}")
+                        extra_error = BackupError(f"mysqlbinlog PITR failed ({e_rc}): {e_stderr.strip()}")
+            except Exception as exc:
+                pipeline_error = exc
             finally:
                 with contextlib.suppress(Exception):
                     proc.stdin.close()
+                if extra_process is not None and extra_process.poll() is None:
+                    with contextlib.suppress(Exception):
+                        extra_process.terminate()
+                    with contextlib.suppress(Exception):
+                        extra_process.wait(timeout=5)
+                    if extra_process.poll() is None:
+                        with contextlib.suppress(Exception):
+                            extra_process.kill()
             rc = proc.wait()
             if rc != 0:
                 err.seek(0)
                 detail = err.read().decode("utf-8", errors="replace").strip()
                 raise BackupError(f"MySQL restore failed ({rc}): {detail}")
+            if extra_error is not None:
+                raise extra_error
+            if pipeline_error is not None:
+                if isinstance(pipeline_error, BackupError):
+                    raise pipeline_error
+                raise BackupError(f"restore stream failed: {pipeline_error}") from pipeline_error
 
     def restore(self, db: str, full: Optional[Path], diff: Optional[Path], latest: bool, yes: bool, to_time: Optional[str] = None) -> None:
+        validate_mysql_identifier(db, "database")
         if not yes:
             raise BackupError("restore is destructive; pass --yes after verifying the target")
+        if to_time and diff is not None:
+            raise BackupError("--diff cannot be combined with --to-time; PITR replays source binary logs directly")
         target_time = parse_iso(to_time) if to_time else None
+        if target_time and target_time > now_local() + dt.timedelta(seconds=1):
+            raise BackupError("PITR target cannot be in the future")
         if latest:
             full = self.full_for_time(db, target_time) if target_time else self.latest_full(db)
             if full is None:
@@ -1283,12 +1581,15 @@ class BackupManager:
             diff_manifest = self.verify_backup(diff, db, "diff", deep=self.s.getbool("general", "verify_before_restore", True))
             if diff_manifest.get("base_full") != full.name:
                 raise BackupError("Diff backup does not belong to selected Full")
-        args, env = self.mysql.mysql_restore_command()
+        args, env = self.restore_mysql.mysql_restore_command()
         with contextlib.ExitStack() as stack:
             streams: List[BinaryIO] = [stack.enter_context(self.encryption.payload_stream(full, full_manifest.get("encryption", {"enabled": False, "provider": "none"})))]
             pitr_proc: Optional[subprocess.Popen] = None
             if to_time:
                 target = target_time or parse_iso(to_time)
+                backup_policy = full_manifest.get("policy") or {}
+                if backup_policy.get("exclude_tables") or backup_policy.get("schema_only_tables"):
+                    raise BackupError("PITR cannot use a table-filtered/schema-only Full backup")
                 completed = parse_iso(full_manifest.get("completed_at", full_manifest.get("started_at", iso_now())))
                 if target < completed:
                     raise BackupError("PITR target is earlier than the selected Full backup completion time")
@@ -1303,11 +1604,20 @@ class BackupManager:
                 if end_log not in available_logs:
                     raise BackupError(f"PITR cannot proceed: current binary log {end_log} is unavailable")
                 selected_logs = available_logs[available_logs.index(base_log):available_logs.index(end_log) + 1]
-                mysql_time = target.astimezone(self.mysql.mysqlbinlog_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+                # mysqlbinlog stops before the first event whose timestamp is
+                # >= --stop-datetime. Add one second so a user target of
+                # 14:37:12 includes events timestamped 14:37:12 while still
+                # excluding 14:37:13 and later. Binary-log timestamps are
+                # second-granularity.
+                inclusive_stop = target + dt.timedelta(seconds=1)
+                mysql_time = inclusive_stop.astimezone(self.mysql.mysqlbinlog_timezone(inclusive_stop)).strftime("%Y-%m-%d %H:%M:%S")
                 bargs, benv = self.mysql.mysqlbinlog_command(
                     db, selected_logs, start_position=int(base_pos), stop_position=int(end_pos), stop_datetime=mysql_time
                 )
-                pitr_proc = subprocess.Popen(bargs, env=benv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    pitr_proc = subprocess.Popen(bargs, env=benv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except FileNotFoundError as exc:
+                    raise BackupError(f"required executable not found: {bargs[0]}") from exc
                 LOG.warning(
                     "PITR uses a fixed source binlog snapshot %s:%s -> %s:%s, stopping at %s",
                     base_log, base_pos, end_log, end_pos, mysql_time
@@ -1319,7 +1629,9 @@ class BackupManager:
         LOG.info("Restore completed: database=%s full=%s diff=%s to_time=%s", db, full, diff, to_time)
 
     def _remove_backup_bundle(self, path: Path) -> None:
-        for p in (path, self.sha_path(path), self.manifest_path(path)):
+        # Remove the completion marker first so a concurrent observer never
+        # interprets a partially pruned bundle as a complete backup.
+        for p in (self.manifest_path(path), self.sha_path(path), path):
             if p.exists():
                 self.remote.delete_local_counterpart(p)
                 p.unlink()
@@ -1405,14 +1717,32 @@ class BackupManager:
                     self._remove_backup_bundle(path)
                 removed["full"] += 1
 
-        # Clean stale partial files after one day.
-        base, _, _ = self.db_paths(db)
+        # Clean stale partials and orphaned finalized payloads whose manifest
+        # was never committed (for example, a crash between data rename and
+        # manifest creation).
+        base, full_dir, diff_dir = self.db_paths(db)
         if base.exists() and not dry_run:
             cutoff = time.time() - 86400
             for partial in base.rglob("*.partial*"):
                 with contextlib.suppress(OSError):
                     if partial.stat().st_mtime < cutoff:
                         partial.unlink()
+            for typ, folder in (("full", full_dir), ("diff", diff_dir)):
+                if not folder.exists():
+                    continue
+                prefix = f"{safe_db_dir(db)}__{typ}__"
+                for candidate in folder.iterdir():
+                    if not candidate.is_file() or not candidate.name.startswith(prefix):
+                        continue
+                    if candidate.name.endswith((".json", ".sha256")) or ".partial" in candidate.name:
+                        continue
+                    with contextlib.suppress(OSError):
+                        if candidate.stat().st_mtime < cutoff and not self.manifest_path(candidate).exists():
+                            LOG.warning("Removing orphaned incomplete backup payload: %s", candidate)
+                            self.remote.delete_local_counterpart(candidate)
+                            with contextlib.suppress(FileNotFoundError):
+                                self.sha_path(candidate).unlink()
+                            candidate.unlink()
         return removed
 
     def prune(self, databases: Optional[Sequence[str]] = None, dry_run: bool = False) -> None:
@@ -1441,8 +1771,8 @@ class BackupManager:
             for typ in ("full", "diff"):
                 for path in self._backup_candidates(db, typ):
                     manifest = self.read_manifest(path)
-                    remote = "yes" if self.remote.enabled else "no"
-                    print(f"{typ}\t{db}\t{manifest.get('completed_at','')}\t{human_bytes(path.stat().st_size)}\tencrypted={manifest.get('encryption',{}).get('enabled',False)}\tremote={remote}\t{path}")
+                    remote = "configured" if self.remote.enabled else "disabled"
+                    print(f"{typ}\t{db}\t{manifest.get('completed_at','')}\t{human_bytes(path.stat().st_size)}\tencrypted={manifest.get('encryption',{}).get('enabled',False)}\tremote_target={remote}\t{path}")
 
     def status(self, as_json: bool = False) -> None:
         payload = dict(self.state.data)
@@ -1495,6 +1825,17 @@ class BackupManager:
             pf = Path(self.s.get("encryption", "openssl_passphrase_file", ""))
             if not pf.exists():
                 errors.append(f"OpenSSL passphrase file missing: {pf}")
+            elif pf.stat().st_mode & 0o077:
+                warnings.append(f"OpenSSL passphrase file is accessible by group/others: {pf}")
+
+        for label, client in (("source", self.mysql), ("restore-target", self.restore_mysql)):
+            if client.defaults_file:
+                credential = Path(client.defaults_file)
+                if client.mode == "native":
+                    if not credential.exists():
+                        errors.append(f"{label} defaults file missing: {credential}")
+                    elif credential.stat().st_mode & 0o077:
+                        warnings.append(f"{label} defaults file should be chmod 600: {credential}")
 
         if self.remote.enabled:
             if shutil.which("rclone"):
@@ -1512,7 +1853,14 @@ class BackupManager:
             ok("mysql", f"connected, version={version}")
             dbs = self.databases()
             ok("databases", ", ".join(dbs) or "none")
-            if any(self.policy(db).diff_schedule.lower() != "off" for db in dbs) or self.s.getbool("diff", "enabled", True):
+            if not self.s.getbool("mysql", "add_drop_database", True):
+                warnings.append("mysql.add_drop_database=false can leave stale objects during restore; true is recommended for exact replacement restores")
+            if "mysql" in dbs:
+                warnings.append("the mysql system schema is selected; system-schema restore is version-sensitive and --add-drop-database is intentionally not used for it")
+            diff_capable = self.s.getbool("diff", "enabled", True) and any(
+                not (self.policy(db).exclude_tables or self.policy(db).schema_only_tables) for db in dbs
+            )
+            if diff_capable:
                 log_bin = self.mysql.variable("log_bin")
                 fmt = self.mysql.variable("binlog_format")
                 if log_bin.upper() not in {"ON", "1"}:
@@ -1529,7 +1877,13 @@ class BackupManager:
                 except Exception as exc:
                     errors.append(str(exc))
         except Exception as exc:
-            errors.append(f"MySQL connectivity failed: {exc}")
+            errors.append(f"MySQL source connectivity failed: {exc}")
+
+        try:
+            target_version = self.restore_mysql.server_version()
+            ok("restore-target", f"connected, version={target_version}, mode={self.restore_mysql.mode}")
+        except Exception as exc:
+            errors.append(f"Restore target connectivity failed: {exc}")
 
         try:
             self.check_free_space()
@@ -1643,8 +1997,13 @@ class BackupManager:
             run(["docker", "rm", "-f", name], check=False)
 
     def _max_age_due(self, db: str, typ: str, now: dt.datetime) -> bool:
-        state = self.state.db(db).get(f"last_{typ}") or {}
+        db_state = self.state.db(db)
+        state = db_state.get(f"last_{typ}") or {}
         when = state.get("time")
+        if typ == "diff":
+            full_when = (db_state.get("last_full") or {}).get("time")
+            if full_when and (not when or parse_iso(full_when) > parse_iso(when)):
+                when = full_when
         if not when:
             return typ == "full" and self.s.getbool("schedule", "full_on_start_if_missing", True)
         age = now - parse_iso(when)
@@ -1665,7 +2024,23 @@ class BackupManager:
 
     def _mark_scheduler(self, key: str, now: dt.datetime) -> None:
         self.state.data.setdefault("scheduler", {})[key] = now.strftime("%Y-%m-%dT%H:%M")
+        self.state.data.setdefault("scheduler_retry", {}).pop(key, None)
         self.state.save()
+
+    def _retry_allowed(self, key: str, now: dt.datetime) -> bool:
+        raw = self.state.data.setdefault("scheduler_retry", {}).get(key)
+        if not raw:
+            return True
+        try:
+            return now >= parse_iso(raw)
+        except Exception:
+            return True
+
+    def _mark_scheduler_failure(self, key: str, now: dt.datetime, error: Exception) -> None:
+        cooldown = self.s.getint("schedule", "retry_cooldown_seconds", 300)
+        retry_at = now + dt.timedelta(seconds=max(0, cooldown))
+        self.state.data.setdefault("scheduler_retry", {})[key] = retry_at.isoformat(timespec="seconds")
+        self.state.set_error(f"{key}: {error}")
 
     def run_daemon(self) -> None:
         poll = max(5, self.s.getint("schedule", "poll_seconds", 20))
@@ -1674,39 +2049,73 @@ class BackupManager:
             now = now_local().replace(second=0, microsecond=0)
             try:
                 dbs = self.databases()
-                for db in dbs:
-                    policy = self.policy(db)
-                    full_key = f"{db}:full"
-                    full_due = self._scheduler_due(full_key, policy.full_schedule, now) or self._max_age_due(db, "full", now) or (self.s.getbool("schedule", "full_on_start_if_missing", True) and self.latest_full(db) is None)
-                    if full_due:
+            except Exception as exc:
+                LOG.exception("Database discovery failed")
+                self.state.set_error(str(exc))
+                dbs = []
+
+            for db in dbs:
+                policy = self.policy(db)
+                full_key = f"{db}:full"
+                diff_key = f"{db}:diff"
+                full_created = False
+
+                try:
+                    full_due = (
+                        self._scheduler_due(full_key, policy.full_schedule, now)
+                        or self._max_age_due(db, "full", now)
+                        or (self.s.getbool("schedule", "full_on_start_if_missing", True) and self.latest_full(db) is None)
+                    )
+                    if full_due and self._retry_allowed(full_key, now):
                         with BackupLock(self.s.lock_file):
                             self.create_full(db)
                             self.prune_database(db)
                         self._mark_scheduler(full_key, now)
+                        full_created = True
+                        # A new Full is a stronger restore point than an immediate
+                        # Diff. Treat the same minute as satisfied and let max-age
+                        # calculations use last_full until a later Diff succeeds.
+                        self._mark_scheduler(diff_key, now)
+                except Exception as exc:
+                    LOG.exception("Scheduled Full failed for %s", db)
+                    self._mark_scheduler_failure(full_key, now, exc)
+                    if self.s.getbool("general", "stop_on_database_error", False):
+                        break
 
-                    diff_key = f"{db}:diff"
+                try:
                     diff_due = self._scheduler_due(diff_key, policy.diff_schedule, now) or self._max_age_due(db, "diff", now)
-                    if diff_due and self.s.getbool("diff", "enabled", True):
+                    if (
+                        not full_created
+                        and diff_due
+                        and self.s.getbool("diff", "enabled", True)
+                        and self._retry_allowed(diff_key, now)
+                    ):
                         with BackupLock(self.s.lock_file):
                             self.create_diff(db)
                             self.prune_database(db)
                         self._mark_scheduler(diff_key, now)
+                except Exception as exc:
+                    LOG.exception("Scheduled Diff failed for %s", db)
+                    self._mark_scheduler_failure(diff_key, now, exc)
+                    if self.s.getbool("general", "stop_on_database_error", False):
+                        break
 
-                rt_expr = self.s.get("restore_test", "schedule", "off")
-                if self.s.getbool("restore_test", "enabled", False) and self._scheduler_due("restore-test", rt_expr, now):
+            rt_expr = self.s.get("restore_test", "schedule", "off")
+            if self.s.getbool("restore_test", "enabled", False) and self._scheduler_due("restore-test", rt_expr, now) and self._retry_allowed("restore-test", now):
+                try:
                     with BackupLock(self.s.lock_file):
                         self.restore_test()
                     self._mark_scheduler("restore-test", now)
-            except BackupError as exc:
-                LOG.error("Scheduler cycle: %s", exc)
-                self.state.set_error(str(exc))
-            except Exception:
-                LOG.exception("Unexpected scheduler failure")
+                except Exception as exc:
+                    LOG.exception("Scheduled restore test failed")
+                    self._mark_scheduler_failure("restore-test", now, exc)
+
             for _ in range(poll):
                 if STOP_REQUESTED:
                     break
                 time.sleep(1)
         LOG.info("MySQL Backup Service stopped")
+
 
 
 def setup_logging(settings: Settings, foreground: bool = True) -> None:
@@ -1785,6 +2194,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Backup payloads, manifests, state, and credential-adjacent artifacts must
+    # never become group/world-readable merely because the invoking shell used a
+    # permissive umask. systemd also sets UMask=0077, but CLI invocations need it.
+    os.umask(0o077)
     args = build_parser().parse_args(argv)
     if args.command == "version":
         print(VERSION)

@@ -1,6 +1,5 @@
 # Keep this file mode 0600.
-# Native-mode location recommended by the sample config:
-# /etc/mysql-backup-service/mysql-client.cnf
+# Backup/binlog SOURCE credentials.
 [client]
 user=backup
 password=CHANGE_ME

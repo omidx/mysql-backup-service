@@ -14,7 +14,7 @@ UMask=0077
 
 # Default is root for broad compatibility with Docker, rclone/AWS credential
 # locations, and arbitrary backup mount points. Native-only deployments can
-# switch to a dedicated service account after granting only the required paths.
+# switch to a dedicated account after granting only the required paths.
 User=root
 Group=root
 NoNewPrivileges=true

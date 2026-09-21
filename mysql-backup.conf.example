@@ -21,6 +21,7 @@ min_free_space_percent = 5
 stop_on_database_error = false
 
 [mysql]
+# Backup/binlog SOURCE.
 # native = mysql/mysqldump/mysqlbinlog installed on this Linux host
 # docker = execute those utilities inside the configured MySQL container
 mode = native
@@ -39,21 +40,46 @@ container_host = 127.0.0.1
 container_port = 3306
 
 # * = discover every non-excluded database.
+# The MySQL system schema is excluded by default because DROP DATABASE mysql is
+# not supported and system-table restore is version-sensitive.
 include_databases = *
-exclude_databases = information_schema,performance_schema,sys
+exclude_databases = information_schema,performance_schema,sys,mysql
 
 set_gtid_purged_off = true
 no_tablespaces = true
-add_drop_database = false
+# Recommended for exact replacement restores. It is intentionally suppressed
+# when backing up the special `mysql` system schema.
+add_drop_database = true
 dump_extra_args =
 mysql_extra_args =
 mysqlbinlog_extra_args =
+
+[restore_target]
+# Optional independent RESTORE destination. When disabled, restore commands
+# fall back to [mysql] for backward compatibility, so `restore --yes` writes to
+# the source connection. Enable this for normal DR/PITR workflows.
+enabled = false
+mode = native
+host = 127.0.0.1
+port = 3306
+socket =
+user = restore
+defaults_extra_file = /etc/mysql-backup-service/mysql-restore-client.cnf
+password =
+# Docker-only target settings
+container = mysql-restore
+container_host = 127.0.0.1
+container_port = 3306
+mysql_extra_args =
 
 [schedule]
 # Global defaults. Per-database sections can override them.
 full = 0 2 * * *
 diff = 0 * * * *
 poll_seconds = 20
+# After a scheduled failure, suppress retry storms while allowing other DBs to
+# continue. 0 disables the cooldown.
+retry_cooldown_seconds = 300
 full_on_start_if_missing = true
 full_max_age_hours = 0
 diff_max_age_minutes = 0
@@ -67,20 +93,18 @@ missing_full_policy = full
 
 [tables]
 # Global table policy. Values are unqualified table names.
-# IMPORTANT: executable mysqlbinlog replay cannot safely filter individual
-# tables. A database using exclude_tables/schema_only_tables must set its
-# diff_schedule = off.
+# IMPORTANT: executable mysqlbinlog replay cannot safely filter arbitrary
+# individual tables. A database using these options must set diff_schedule=off.
 exclude_tables =
 schema_only_tables =
 
 [retention]
-# Used when GFS is disabled for a database.
+# Used when GFS is disabled for a database. 0 disables age-based deletion.
 full_days = 30
 diff_days = 14
 minimum_full_backups = 2
 
 # GFS smart retention. >0 enables GFS selection for Full backups.
-# Keeps newest Full per day/week/month bucket.
 gfs_daily = 7
 gfs_weekly = 4
 gfs_monthly = 12
@@ -91,7 +115,7 @@ gfs_monthly = 12
 enabled = false
 provider = age
 
-# age (recommended for simple file encryption)
+# age
 age_recipient =
 age_identity_file = /etc/mysql-backup-service/age.key
 
@@ -105,7 +129,7 @@ openssl_pbkdf2_iterations = 200000
 
 [remote]
 # rclone supports S3-compatible storage (AWS S3, MinIO, Backblaze B2 S3),
-# native B2, SFTP, FTP, and many other backends.
+# native B2, SFTP, FTP, local paths, and many other backends.
 enabled = false
 backend = rclone
 # Examples:
@@ -124,10 +148,8 @@ bwlimit =
 prune_with_local = false
 
 [object_lock]
-# Optional S3-compatible immutability. Requires:
-# - S3 bucket with Object Lock/versioning enabled
-# - aws CLI configured for the same S3-compatible endpoint
-# - s3:PutObjectRetention equivalent permission
+# Optional S3-compatible immutability. Requires a bucket created with Object
+# Lock/versioning enabled and aws CLI credentials that can PutObjectRetention.
 enabled = false
 bucket =
 prefix = server01
@@ -138,14 +160,13 @@ region =
 aws_profile =
 
 [throttle]
-# Lower priority for mysqldump/mysqlbinlog child processes.
+# Lower priority for native mysqldump/mysqlbinlog child processes.
 # nice: 0 disables wrapper; common production value: 10
 nice = 10
 # ionice_class: 0 disables; 2 = best-effort, 3 = idle
 ionice_class = 2
 ionice_level = 7
-# Approximate uncompressed stream throttle for dump/binlog generation.
-# 0 = unlimited. Example: 50 means ~50 MiB/s.
+# Approximate uncompressed stream throttle. 0 = unlimited.
 local_stream_mbps = 0
 
 [restore_test]
@@ -156,8 +177,6 @@ docker_image = mysql:8.4
 startup_timeout_seconds = 120
 databases = *
 # Optional queries separated by ||. {{database}} is replaced at runtime.
-# Example:
-# validation_queries = SELECT 1 || SELECT COUNT(*) FROM `{{database}}`.important_table
 validation_queries = SELECT 1
 
 [notifications]
@@ -166,7 +185,7 @@ on_success = false
 on_failure = true
 
 # ---------------------------------------------------------------------------
-# Per-database policy example
+# Per-database policy examples
 # ---------------------------------------------------------------------------
 # [database:appdb]
 # enabled = true
@@ -191,7 +210,7 @@ on_failure = true
 # gfs_weekly = 8
 # gfs_monthly = 24
 #
-# Table-filtered database example (Full only):
+# Table-filtered Full-only example:
 # [database:analytics]
 # full_schedule = 0 4 * * *
 # diff_schedule = off
