@@ -652,6 +652,10 @@ class MySQLClient:
         self.password = cfg("password", "")
         self.defaults_file = cfg("defaults_extra_file", "")
         self.container = cfg("container", "mysql")
+        # Docker Official mysql:8.4 is based on mysql-community-server-minimal
+        # and does not ship mysqlbinlog. A companion tools container can be
+        # configured without changing the database container itself.
+        self.binlog_container = cfg("binlog_container", "").strip() or self.container
         self.container_host = cfg("container_host", "127.0.0.1")
         self.container_port = cfg_int("container_port", 3306)
         self._dump_help: Optional[str] = None
@@ -677,7 +681,8 @@ class MySQLClient:
             args = ["docker", "exec", "-i"]
             if self.password:
                 args += ["-e", f"MYSQL_PWD={self.password}"]
-            args += [self.container, tool]
+            tool_container = self.binlog_container if tool == "mysqlbinlog" else self.container
+            args += [tool_container, tool]
             host, port = self.container_host, self.container_port
         else:
             args = [tool]
@@ -827,10 +832,10 @@ class MySQLClient:
         if self.mode == "native":
             return dt.datetime.fromtimestamp(when.timestamp()).astimezone().tzinfo or dt.timezone.utc
         epoch = int(when.timestamp())
-        proc = self.run(["docker", "exec", self.container, "date", "-d", f"@{epoch}", "+%z"], check=False)
+        proc = self.run(["docker", "exec", self.binlog_container, "date", "-d", f"@{epoch}", "+%z"], check=False)
         if proc.returncode != 0:
             LOG.warning("Container date does not support historical offset lookup; using its current UTC offset")
-            proc = self.run(["docker", "exec", self.container, "date", "+%z"], check=False)
+            proc = self.run(["docker", "exec", self.binlog_container, "date", "+%z"], check=False)
         text = proc.stdout.strip() if proc.returncode == 0 else ""
         match = re.fullmatch(r"([+-])(\d{2})(\d{2})", text)
         if not match:
@@ -1812,6 +1817,12 @@ class BackupManager:
         else:
             if shutil.which("docker"):
                 ok("docker", shutil.which("docker") or "")
+                for tool in ("mysql", "mysqldump"):
+                    probe = self.mysql.run(["docker", "exec", self.mysql.container, tool, "--version"], check=False)
+                    if probe.returncode == 0:
+                        ok(tool, f"docker:{self.mysql.container}")
+                    else:
+                        errors.append(f"{tool} is unavailable in Docker source container {self.mysql.container}")
             else:
                 errors.append("docker executable is missing")
 
@@ -1861,6 +1872,20 @@ class BackupManager:
                 not (self.policy(db).exclude_tables or self.policy(db).schema_only_tables) for db in dbs
             )
             if diff_capable:
+                if self.mysql.mode == "docker":
+                    probe = self.mysql.run(
+                        ["docker", "exec", self.mysql.binlog_container, "mysqlbinlog", "--version"],
+                        check=False,
+                    )
+                    if probe.returncode == 0:
+                        ok("mysqlbinlog", f"docker:{self.mysql.binlog_container}")
+                    else:
+                        errors.append(
+                            "mysqlbinlog is unavailable in Docker binlog container "
+                            f"{self.mysql.binlog_container}; configure mysql.binlog_container to a companion "
+                            "tools container (see docker/mysql-tools/Dockerfile) or use a custom MySQL image "
+                            "that includes mysql-community-client"
+                        )
                 log_bin = self.mysql.variable("log_bin")
                 fmt = self.mysql.variable("binlog_format")
                 if log_bin.upper() not in {"ON", "1"}:
@@ -1951,7 +1976,10 @@ class BackupManager:
             deadline = time.time() + timeout
             ready = False
             while time.time() < deadline:
-                probe = run(["docker", "exec", "-e", f"MYSQL_PWD={password}", name, "mysqladmin", "-uroot", "ping", "--silent"], check=False)
+                probe = run(
+                    ["docker", "exec", "-e", f"MYSQL_PWD={password}", name, "mysql", "-uroot", "--batch", "--skip-column-names", "-e", "SELECT 1"],
+                    check=False,
+                )
                 if probe.returncode == 0:
                     ready = True
                     break
