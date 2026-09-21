@@ -36,6 +36,10 @@ password =
 
 # Docker-only source settings
 container = mysql
+# Optional container that provides mysqlbinlog for Diff/PITR. Leave blank to
+# use the source container. Docker Official mysql:8.4 is server-minimal and
+# needs the companion image in docker/mysql-tools/Dockerfile.
+binlog_container =
 container_host = 127.0.0.1
 container_port = 3306
 
