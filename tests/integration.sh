@@ -5,12 +5,14 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="$(mktemp -d)"
 SOURCE_CONTAINER="mysql-backup-src-${RANDOM}-${RANDOM}"
 TARGET_CONTAINER="mysql-backup-dst-${RANDOM}-${RANDOM}"
+TOOLS_CONTAINER="mysql-backup-tools-${RANDOM}-${RANDOM}"
+TOOLS_IMAGE="mysql-backup-tools:ci"
 ROOT_PASSWORD='IntegrationRoot-42!'
 CONFIG="$WORK_DIR/integration.ini"
 PASSPHRASE="$WORK_DIR/backup.passphrase"
 
 cleanup() {
-  docker rm -f "$SOURCE_CONTAINER" "$TARGET_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$SOURCE_CONTAINER" "$TARGET_CONTAINER" "$TOOLS_CONTAINER" >/dev/null 2>&1 || true
   rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
@@ -56,6 +58,14 @@ docker run -d --name "$TARGET_CONTAINER" \
 wait_mysql "$SOURCE_CONTAINER"
 wait_mysql "$TARGET_CONTAINER"
 
+# Docker Official mysql:8.4 uses mysql-community-server-minimal and does not
+# include mysqlbinlog. Build the repo's companion tools image and share the
+# source container's network namespace so 127.0.0.1:3306 reaches the source.
+docker build -q -f "$ROOT_DIR/docker/mysql-tools/Dockerfile" -t "$TOOLS_IMAGE" "$ROOT_DIR" >/dev/null
+docker run -d --name "$TOOLS_CONTAINER" --network container:"$SOURCE_CONTAINER" \
+  "$TOOLS_IMAGE" sleep infinity >/dev/null
+docker exec "$TOOLS_CONTAINER" mysqlbinlog --version >/dev/null
+
 mysql_exec "$SOURCE_CONTAINER" -e "CREATE DATABASE appdb; CREATE TABLE appdb.items(id INT PRIMARY KEY, note VARCHAR(100)); INSERT INTO appdb.items VALUES (1,'one'),(2,'two');"
 
 cat > "$CONFIG" <<EOF_CONFIG
@@ -76,6 +86,7 @@ stop_on_database_error = false
 [mysql]
 mode = docker
 container = $SOURCE_CONTAINER
+binlog_container = $TOOLS_CONTAINER
 container_host = 127.0.0.1
 container_port = 3306
 user = root
