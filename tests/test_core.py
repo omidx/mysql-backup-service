@@ -219,6 +219,34 @@ filter_by_database=true
         self.assertIn("--database=app", joined)
         self.assertTrue(joined.endswith("bin.000001 bin.000002"))
 
+    def test_docker_mysqlbinlog_uses_companion_container(self):
+        s, _ = self.config("""
+[mysql]
+mode=docker
+container=mysql-source
+binlog_container=mysql-tools
+container_host=127.0.0.1
+container_port=3306
+user=backup
+password=secret
+""")
+        c = mod.MySQLClient(s)
+        args, _ = c.mysqlbinlog_command("app", ["bin.000001"], start_position=4)
+        self.assertIn("mysql-tools", args)
+        self.assertNotIn("mysql-source", args)
+        self.assertIn("mysqlbinlog", args)
+
+    def test_docker_mysqlbinlog_defaults_to_source_container(self):
+        s, _ = self.config("""
+[mysql]
+mode=docker
+container=mysql-source
+user=backup
+""")
+        c = mod.MySQLClient(s)
+        args, _ = c.mysqlbinlog_command("app", ["bin.000001"])
+        self.assertIn("mysql-source", args)
+
     def test_restore_target_falls_back_when_disabled(self):
         s, _ = self.config("""
 [mysql]
