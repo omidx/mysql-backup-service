@@ -549,6 +549,7 @@ backup_root={td if False else '/tmp'}
         cfg.write_text(f"""[general]
 state_dir={td}/state
 backup_root={td}
+lock_file={td}/service.lock
 stop_on_database_error=false
 [schedule]
 full=* * * * *
@@ -590,6 +591,7 @@ enabled=false
         cfg.write_text(f"""[general]
 state_dir={td}/state
 backup_root={td}
+lock_file={td}/service.lock
 [schedule]
 full=* * * * *
 diff=* * * * *
