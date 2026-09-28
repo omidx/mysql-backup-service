@@ -1,5 +1,7 @@
 # MySQL Backup Service
 
+Operator guides: [Wiki](https://github.com/omidx/mysql-backup-service/wiki) · [Security policy](SECURITY.md)
+
 Production-oriented MySQL backup service for Linux with **Full + binary-log differential backups**, per-database schedules, encryption, off-host replication, point-in-time recovery, automated restore testing, GFS retention, throttling, and systemd startup.
 
 Current version: **2.1.0**
